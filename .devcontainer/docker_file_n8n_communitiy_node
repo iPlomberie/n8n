@@ -1,0 +1,24 @@
+# Utilisez l'image officielle de n8n comme base
+# Cela garantit que vous avez toujours la dernière version stable de n8n
+FROM n8nio/n8n:latest
+
+# Définissez le répertoire de travail à l'intérieur du conteneur
+WORKDIR /usr/local/bin/n8n
+
+# Installez votre nœud communautaire
+# Remplacez 'nom-du-paquet-du-noeud-communautaire' par le nom npm réel du nœud.
+# Si vous avez plusieurs nœuds, ajoutez une ligne RUN npm install pour chacun ou listez-les.
+RUN npm install nom-du-paquet-du-noeud-communautaire
+
+# Configurez la variable d'environnement pour que n8n sache où trouver les extensions personnalisées.
+# Le chemin doit pointer vers le répertoire racine du package installé dans node_modules.
+ENV N8N_CUSTOM_EXTENSIONS=/usr/local/bin/n8n/node_modules/nom-du-paquet-du-noeud-communautaire
+
+# Si vous avez plusieurs nœuds, listez leurs chemins séparés par des virgules:
+# ENV N8N_CUSTOM_EXTENSIONS=/usr/local/bin/n8n/node_modules/noeud-1,/usr/local/bin/n8n/node_modules/noeud-2
+
+# Exposez le port par défaut de n8n (si ce n'est pas déjà fait par l'image de base)
+EXPOSE 5678
+
+# Commande pour démarrer n8n (souvent déjà définie dans l'image de base, mais peut être explicitée)
+CMD ["n8n"]
