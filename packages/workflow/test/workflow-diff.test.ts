@@ -15,8 +15,10 @@ import {
 	hasCredentialChanges,
 	hasNonPositionalChanges,
 	NodeDiffStatus,
+	parametersAreSuperset,
 	RULES,
 	SKIP_RULES,
+	stringContainsParts,
 	WorkflowChangeSet,
 	type DiffableNode,
 	type DiffableWorkflow,
@@ -57,6 +59,15 @@ describe('compareNodes', () => {
 		parameters: INodeParameters;
 		position: [number, number];
 		disabled: boolean;
+		notes?: string;
+		notesInFlow?: boolean;
+		onError?: string;
+		continueOnFail?: boolean;
+		retryOnFail?: boolean;
+		maxTries?: number;
+		waitBetweenTries?: number;
+		alwaysOutputData?: boolean;
+		executeOnce?: boolean;
 	};
 
 	it('should return true for identical nodes', () => {
@@ -122,13 +133,33 @@ describe('compareNodes', () => {
 		expect(result).toBe(false);
 	});
 
-	it('should ignore properties not in comparison list', () => {
-		const node1 = createTestNode({ position: [100, 200], disabled: false });
-		const node2 = createTestNode({ position: [300, 400], disabled: true });
+	it('should ignore position changes', () => {
+		const node1 = createTestNode({ position: [100, 200] });
+		const node2 = createTestNode({ position: [300, 400] });
 
 		const result = compareNodes(node1, node2);
 
 		expect(result).toBe(true);
+	});
+
+	test.each([
+		['disabled', true],
+		['notes', 'handle rate limits here'],
+		['notesInFlow', true],
+		['onError', 'continueRegularOutput'],
+		['continueOnFail', true],
+		['retryOnFail', true],
+		['maxTries', 5],
+		['waitBetweenTries', 2000],
+		['alwaysOutputData', true],
+		['executeOnce', true],
+	])('should return false when nodes have different %s settings', (property, value) => {
+		const node1 = createTestNode();
+		const node2 = createTestNode({ [property]: value } as Partial<TestNode>);
+
+		const result = compareNodes(node1, node2);
+
+		expect(result).toBe(false);
 	});
 
 	it('should handle undefined base node', () => {
@@ -466,12 +497,17 @@ describe('groupWorkflows', () => {
 	});
 	describe('rules', () => {
 		describe('mergeAdditiveChanges', () => {
-			const createWorkflow = (id: string, nodes: DiffableNode[]): IWorkflowBase => {
+			const createWorkflow = (
+				id: string,
+				nodes: DiffableNode[],
+				nodeGroups: IWorkflowBase['nodeGroups'] = [],
+			): IWorkflowBase => {
 				return {
 					id,
 					nodes,
 					connections: {},
 					createdAt: new Date(),
+					nodeGroups,
 				} as IWorkflowBase;
 			};
 
@@ -487,6 +523,14 @@ describe('groupWorkflows', () => {
 					baseWorkflow: createWorkflow('1', [{ id: '1', parameters: { a: 'value1' }, name: 'n1' }]),
 					nextWorkflow: createWorkflow('1', [
 						{ id: '1', parameters: { a: 'value1', b: 'value2' }, name: 'n1' },
+					]),
+					expected: false,
+				},
+				{
+					description: 'should return false when a node setting changes',
+					baseWorkflow: createWorkflow('1', [{ id: '1', parameters: { a: 'value1' }, name: 'n1' }]),
+					nextWorkflow: createWorkflow('1', [
+						{ id: '1', parameters: { a: 'value1' }, name: 'n1', disabled: true } as DiffableNode,
 					]),
 					expected: false,
 				},
@@ -526,6 +570,188 @@ describe('groupWorkflows', () => {
 					baseWorkflow: createWorkflow('1', []),
 					nextWorkflow: createWorkflow('1', []),
 					expected: true,
+				},
+				{
+					description: 'should handle nested node',
+					baseWorkflow: createWorkflow('1', [
+						{
+							id: '1',
+							parameters: {
+								conditions: {
+									combinator: 'and',
+									conditions: [
+										{
+											id: 'a561e9ba-ec13-4280-813c-28439d2e57df',
+											leftValue: '={{ $json.da',
+											operator: {
+												name: 'filter.operator.equals',
+												operation: 'equals',
+												type: 'string',
+											},
+											rightValue: '',
+										},
+									],
+									options: {
+										caseSensitive: true,
+										leftValue: '',
+										typeValidation: 'strict',
+										version: 3,
+									},
+								},
+								options: {},
+							},
+							name: 'n1',
+						},
+					]),
+					nextWorkflow: createWorkflow('1', [
+						{
+							id: '1',
+							parameters: {
+								conditions: {
+									combinator: 'and',
+									conditions: [
+										{
+											id: 'a561e9ba-ec13-4280-813c-28439d2e57df',
+											leftValue: '={{ $json.dayOffset }}', // changed value
+											operator: {
+												name: 'filter.operator.equals',
+												operation: 'equals',
+												type: 'string',
+											},
+											rightValue: '',
+										},
+									],
+									options: {
+										caseSensitive: true,
+										leftValue: '',
+										typeValidation: 'strict',
+										version: 3,
+									},
+								},
+								options: {},
+							},
+							name: 'n1',
+						},
+					]),
+					expected: true,
+				},
+				{
+					description: 'should return true when next string contains parts of previous string',
+					baseWorkflow: createWorkflow('1', [{ id: '1', parameters: { a: 'value1' }, name: 'n1' }]),
+					nextWorkflow: createWorkflow('1', [
+						{ id: '1', parameters: { a: 'val with some text ue1' }, name: 'n1' },
+					]),
+					expected: true,
+				},
+				{
+					description: 'should return false when prev string contains parts of next string',
+					baseWorkflow: createWorkflow('1', [
+						{ id: '1', parameters: { a: 'val with some text ue1' }, name: 'n1' },
+					]),
+					nextWorkflow: createWorkflow('1', [{ id: '1', parameters: { a: 'value1' }, name: 'n1' }]),
+					expected: false,
+				},
+				{
+					description: 'should return true when an unchanged group is present',
+					baseWorkflow: createWorkflow(
+						'1',
+						[{ id: '1', parameters: {}, name: 'n1' }],
+						[{ id: 'g1', name: 'Group 1', nodeIds: ['1'] }],
+					),
+					nextWorkflow: createWorkflow(
+						'1',
+						[{ id: '1', parameters: {}, name: 'n1' }],
+						[{ id: 'g1', name: 'Group 1', nodeIds: ['1'] }],
+					),
+					expected: true,
+				},
+				{
+					description: 'should return true when a group is added',
+					baseWorkflow: createWorkflow('1', [{ id: '1', parameters: {}, name: 'n1' }]),
+					nextWorkflow: createWorkflow(
+						'1',
+						[{ id: '1', parameters: {}, name: 'n1' }],
+						[{ id: 'g1', name: 'Group 1', nodeIds: ['1'] }],
+					),
+					expected: true,
+				},
+				{
+					description: 'should return true when a node is added to an existing group',
+					baseWorkflow: createWorkflow(
+						'1',
+						[
+							{ id: '1', parameters: {}, name: 'n1' },
+							{ id: '2', parameters: {}, name: 'n2' },
+						],
+						[{ id: 'g1', name: 'Group 1', nodeIds: ['1'] }],
+					),
+					nextWorkflow: createWorkflow(
+						'1',
+						[
+							{ id: '1', parameters: {}, name: 'n1' },
+							{ id: '2', parameters: {}, name: 'n2' },
+						],
+						[{ id: 'g1', name: 'Group 1', nodeIds: ['1', '2'] }],
+					),
+					expected: true,
+				},
+				{
+					description: 'should return false when a group is removed',
+					baseWorkflow: createWorkflow(
+						'1',
+						[{ id: '1', parameters: {}, name: 'n1' }],
+						[{ id: 'g1', name: 'Group 1', nodeIds: ['1'] }],
+					),
+					nextWorkflow: createWorkflow('1', [{ id: '1', parameters: {}, name: 'n1' }]),
+					expected: false,
+				},
+				{
+					description: 'should return false when a group is renamed',
+					baseWorkflow: createWorkflow(
+						'1',
+						[{ id: '1', parameters: {}, name: 'n1' }],
+						[{ id: 'g1', name: 'Group 1', nodeIds: ['1'] }],
+					),
+					nextWorkflow: createWorkflow(
+						'1',
+						[{ id: '1', parameters: {}, name: 'n1' }],
+						[{ id: 'g1', name: 'Renamed Group', nodeIds: ['1'] }],
+					),
+					expected: false,
+				},
+				{
+					description: 'should return false when a group description changes',
+					baseWorkflow: createWorkflow(
+						'1',
+						[{ id: '1', parameters: {}, name: 'n1' }],
+						[{ id: 'g1', name: 'Group 1', nodeIds: ['1'], description: 'Before' }],
+					),
+					nextWorkflow: createWorkflow(
+						'1',
+						[{ id: '1', parameters: {}, name: 'n1' }],
+						[{ id: 'g1', name: 'Group 1', nodeIds: ['1'], description: 'After' }],
+					),
+					expected: false,
+				},
+				{
+					description: 'should return false when a node is removed from a group',
+					baseWorkflow: createWorkflow(
+						'1',
+						[
+							{ id: '1', parameters: {}, name: 'n1' },
+							{ id: '2', parameters: {}, name: 'n2' },
+						],
+						[{ id: 'g1', name: 'Group 1', nodeIds: ['1', '2'] }],
+					),
+					nextWorkflow: createWorkflow(
+						'1',
+						[
+							{ id: '1', parameters: {}, name: 'n1' },
+							{ id: '2', parameters: {}, name: 'n2' },
+						],
+						[{ id: 'g1', name: 'Group 1', nodeIds: ['1'] }],
+					),
+					expected: false,
 				},
 			])('$description', ({ baseWorkflow, nextWorkflow, expected }) => {
 				const result = RULES.mergeAdditiveChanges(
@@ -803,7 +1029,63 @@ describe('groupWorkflows', () => {
 		});
 	});
 });
-
+describe('stringContainsParts', () => {
+	test.each([
+		['abcde', 'abde', true],
+		['abcde', 'abced', false],
+		['abc', 'abcd', false],
+		['abcde', '', true],
+		['abcde', 'abcde', true],
+		['', 'a', false],
+		['abcde', 'c', true],
+		['abcde', 'z', false],
+		['abcde', 'abc', true],
+		['abcde', 'cde', true],
+		['abcde', 'abfz', false],
+		['abcde', 'ace', true],
+		['abcde', 'aec', false],
+		['value1', 'value2', false],
+	])('$[0]', (s, substr, expected) => {
+		const result = stringContainsParts(s, substr);
+		expect(result).toBe(expected);
+	});
+});
+describe('parametersAreSuperset', () => {
+	test.each([
+		[42, 42, true],
+		['test', 'test', true],
+		['test', 'test1', true],
+		[true, true, true],
+		[42, 43, false],
+		['test', 'different', false],
+		[true, false, false],
+		['abc', 'a with b and c', true],
+		['a with b and c', 'abc', false],
+		[{ a: 1, b: 'test' }, { a: 1, b: 'test' }, true],
+		[{ a: 1 }, { b: 1 }, false],
+		[{ a: 1 }, { a: 2 }, false],
+		[{ a: '1' }, { a: '12' }, true],
+		[[1, 2, 3], [1, 2, 3], true],
+		[[1, 2], [1, 2, 3], false],
+		[[1, 2, 3], [1, 2, 4], false],
+		[{ a: { b: 'test' } }, { a: { b: 'test with extra' } }, true],
+		[{ a: { b: 'test with extra' } }, { a: { b: 'test' } }, false],
+		[{ a: { b: { c: 'test' } }, d: 1 }, { a: { b: { c: 'test' } }, d: 1 }, true],
+		[{ a: { b: { c: 'test' } }, d: 1 }, { a: { b: { c: 'different' } }, d: 1 }, false],
+		[{ a: { b: { c: 'test' } }, d: 1 }, { a: { b: { c: 'test', e: 'extra' } }, d: 1 }, false],
+		[{ a: { b: { c: 'test' } }, d: 1 }, { a: { b: { e: 'extra' } }, d: 1 }, false],
+		[{ a: { b: { c: 'test', f: 'new' } }, d: 1 }, { a: { b: { c: 'test' } }, d: 1 }, false],
+		[{ a: { b: { c: 'test' } }, d: 1 }, { a: { b: { c: 'test', f: 'new' } }, d: 1 }, false],
+		[{ a: { b: { c: { g: 'nested' } } }, d: 1 }, { a: { b: { c: { g: 'nested1' } } }, d: 1 }, true],
+		[{ a: { b: { c: { g: 'nested' } } }, d: 1 }, { a: { b: { c: { h: 'new' } }, d: 1 } }, false],
+		[42, '42', false],
+		[{ a: 1 }, [1], false],
+		[null, {}, false],
+	])('parametersAreSuperset(%j, %j)', (prev, next, expected) => {
+		const result = parametersAreSuperset(prev, next);
+		expect(result).toBe(expected);
+	});
+});
 describe('hasNonPositionalChanges', () => {
 	const createNode = (id: string, overrides: Partial<INode> = {}): INode => ({
 		id,
@@ -854,6 +1136,15 @@ describe('hasNonPositionalChanges', () => {
 	it('should return true when node parameters change', () => {
 		const oldNodes = [createNode('1', { parameters: { param1: 'value1' } })];
 		const newNodes = [createNode('1', { parameters: { param1: 'value2' } })];
+
+		const result = hasNonPositionalChanges(oldNodes, newNodes, {}, {});
+
+		expect(result).toBe(true);
+	});
+
+	it('should return true when a node is disabled', () => {
+		const oldNodes = [createNode('1')];
+		const newNodes = [createNode('1', { disabled: true })];
 
 		const result = hasNonPositionalChanges(oldNodes, newNodes, {}, {});
 

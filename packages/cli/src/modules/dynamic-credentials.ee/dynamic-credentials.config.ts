@@ -17,4 +17,24 @@ export class DynamicCredentialsConfig {
 	 */
 	@Env('N8N_DYNAMIC_CREDENTIALS_CORS_ALLOW_CREDENTIALS')
 	corsAllowCredentials: boolean = false;
+
+	/**
+	 * Authentication token for the dynamic credentials endpoints.
+	 */
+	@Env('N8N_DYNAMIC_CREDENTIALS_ENDPOINT_AUTH_TOKEN')
+	endpointAuthToken: string = '';
+
+	/**
+	 * Maximum requests per IP per minute to unauthenticated dynamic credential endpoints
+	 * Default: 60
+	 */
+	@Env('N8N_DYNAMIC_CREDENTIALS_RATE_LIMIT_PER_MINUTE')
+	rateLimitPerMinute: number = 60;
+
+	/**
+	 * Maximum requests per IP per minute to `POST /credentials/:id/authorize`.
+	 * Default: 60.
+	 */
+	@Env('N8N_DYNAMIC_CREDENTIALS_AUTHORIZE_RATE_LIMIT_PER_MINUTE')
+	rateLimitAuthorizePerMinute: number = 60;
 }

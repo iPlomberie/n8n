@@ -1,46 +1,35 @@
-import type { WorkflowTitleStatus } from '@/Interface';
-import { useSettingsStore } from '@/app/stores/settings.store';
-import { ref, type Ref } from 'vue';
+import {
+	useDocumentTitle as useDocumentTitleBase,
+	type WorkflowTitleStatus,
+} from '@n8n/composables/useDocumentTitle';
+import { useSettingsStore } from '@n8n/stores/settings.store';
+import { onScopeDispose, ref, type Ref } from 'vue';
 
-const DEFAULT_TITLE = 'n8n';
-const DEFAULT_TAGLINE = 'Workflow Automation';
+export type { WorkflowTitleStatus };
+
+// Hosts that embed a workflow canvas but name the tab after something else
+// (Instance AI names it after the conversation, not the previewed workflow)
+// claim the title while mounted, which turns `setDocumentTitle` into a no-op —
+// the workflow-flavoured setter the canvas and its execution handlers call.
+// Counted, not a boolean: a transient remount claims from the new instance
+// before the outgoing one disposes.
+const titleClaims = ref(0);
+
+export function claimDocumentTitle() {
+	titleClaims.value++;
+	onScopeDispose(() => titleClaims.value--);
+}
 
 export function useDocumentTitle(windowRef?: Ref<Window | undefined>) {
 	const settingsStore = useSettingsStore();
 	const { releaseChannel } = settingsStore.settings;
-	const suffix =
-		!releaseChannel || releaseChannel === 'stable'
-			? DEFAULT_TITLE
-			: `${DEFAULT_TITLE}[${releaseChannel.toUpperCase()}]`;
+	const base = useDocumentTitleBase({ releaseChannel, windowRef });
 
-	const currentState = ref<WorkflowTitleStatus | undefined>(undefined);
-
-	const set = (title: string) => {
-		const sections = [title || DEFAULT_TAGLINE, suffix];
-		(windowRef?.value?.document ?? document).title = sections.join(' - ');
+	return {
+		...base,
+		setDocumentTitle: (workflowName: string, status: WorkflowTitleStatus) => {
+			if (titleClaims.value > 0) return;
+			base.setDocumentTitle(workflowName, status);
+		},
 	};
-
-	const reset = () => {
-		currentState.value = undefined;
-		set('');
-	};
-
-	const setDocumentTitle = (workflowName: string, status: WorkflowTitleStatus) => {
-		currentState.value = status;
-		let prefix = '⚠️';
-		if (status === 'EXECUTING') {
-			prefix = '🔄';
-		} else if (status === 'IDLE') {
-			prefix = '▶️';
-		} else if (status === 'AI_BUILDING') {
-			prefix = '[Building]';
-		} else if (status === 'AI_DONE') {
-			prefix = '[Done]';
-		}
-		set(`${prefix} ${workflowName}`);
-	};
-
-	const getDocumentState = () => currentState.value;
-
-	return { set, reset, setDocumentTitle, getDocumentState };
 }

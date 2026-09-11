@@ -1,7 +1,9 @@
-import { CorsService } from '@/services/cors-service';
 import type { CorsOptions, Method } from '@n8n/decorators';
 import { Service } from '@n8n/di';
 import type { Request, Response } from 'express';
+
+import { CorsService } from '@/services/cors-service';
+
 import { DynamicCredentialsConfig } from '../dynamic-credentials.config';
 
 @Service()
@@ -43,7 +45,7 @@ export class DynamicCredentialCorsService {
 
 		this.defaultOptions = {
 			allowedOrigins,
-			allowedHeaders: ['Authorization', 'Content-Type', 'X-Requested-With'],
+			allowedHeaders: ['Authorization', 'Content-Type', 'X-Requested-With', 'X-Authorization'],
 			allowCredentials: this.dynamicCredentialConfig.corsAllowCredentials,
 		};
 	}

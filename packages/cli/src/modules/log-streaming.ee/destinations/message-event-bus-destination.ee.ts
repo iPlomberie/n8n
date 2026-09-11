@@ -12,11 +12,11 @@ import { MessageEventBusDestinationTypeNames } from 'n8n-workflow';
 import { v4 as uuid } from 'uuid';
 
 import type { AbstractEventMessage } from '@/eventbus/event-message-classes/abstract-event-message';
+import { eventMessageGenericDestinationTestEvent } from '@/eventbus/event-message-classes/event-message-generic';
 import type {
 	MessageEventBus,
 	MessageWithCallback,
 } from '@/eventbus/message-event-bus/message-event-bus';
-import { License } from '@/license';
 import { CircuitBreaker } from '@/utils/circuit-breaker';
 
 export abstract class MessageEventBusDestination implements MessageEventBusDestinationOptions {
@@ -27,8 +27,6 @@ export abstract class MessageEventBusDestination implements MessageEventBusDesti
 	readonly eventBusInstance: MessageEventBus;
 
 	protected readonly logger: Logger;
-
-	protected readonly license: License;
 
 	protected circuitBreakerInstance: CircuitBreaker;
 
@@ -44,10 +42,13 @@ export abstract class MessageEventBusDestination implements MessageEventBusDesti
 
 	anonymizeAuditMessages: boolean;
 
+	// Raw configured circuit-breaker options as received, used for serializing.
+	// Needed to be set this way so that we do not send default settings, only what user saved.
+	readonly circuitBreakerOptions?: MessageEventBusDestinationOptions['circuitBreaker'];
+
 	constructor(eventBusInstance: MessageEventBus, options: MessageEventBusDestinationOptions) {
 		// @TODO: Use DI
 		this.logger = Container.get(Logger);
-		this.license = Container.get(License);
 
 		const timeout = options.circuitBreaker?.maxDuration ?? LOGSTREAMING_CB_DEFAULT_MAX_DURATION_MS;
 		const maxFailures = options.circuitBreaker?.maxFailures ?? LOGSTREAMING_CB_DEFAULT_MAX_FAILURES;
@@ -66,6 +67,8 @@ export abstract class MessageEventBusDestination implements MessageEventBusDesti
 			failureWindow,
 			maxConcurrentHalfOpenRequests,
 		});
+
+		this.circuitBreakerOptions = options.circuitBreaker;
 
 		this.eventBusInstance = eventBusInstance;
 		this.id = !options.id || options.id.length !== 36 ? uuid() : options.id;
@@ -100,6 +103,7 @@ export abstract class MessageEventBusDestination implements MessageEventBusDesti
 			enabled: this.enabled,
 			subscribedEvents: this.subscribedEvents,
 			anonymizeAuditMessages: this.anonymizeAuditMessages,
+			circuitBreaker: this.circuitBreakerOptions,
 		};
 	}
 
@@ -107,8 +111,17 @@ export abstract class MessageEventBusDestination implements MessageEventBusDesti
 
 	/**
 	 * Send a message to this destination with circuit breaker protection
+	 * Includes filtering logic for event subscription checks
+	 * Note: License check is done at module level via @BackendModule decorator
 	 */
 	async sendMessage(emitterPayload: MessageWithCallback): Promise<boolean> {
+		const { msg } = emitterPayload;
+
+		// Skip checks for test events
+		if (msg.eventName !== eventMessageGenericDestinationTestEvent) {
+			if (!this.hasSubscribedToEvent(msg)) return false;
+		}
+
 		return await this.circuitBreakerInstance.execute(async () => {
 			return await this.receiveFromEventBus(emitterPayload);
 		});

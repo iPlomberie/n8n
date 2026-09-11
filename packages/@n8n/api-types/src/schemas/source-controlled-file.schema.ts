@@ -1,5 +1,8 @@
 import { z } from 'zod';
 
+import { contentImportPolicyResultSchema } from './content-import-policy-result.schema';
+import { workflowPublishBlockedDetailsSchema } from '../workflow-publish-blocked-details';
+
 const FileTypeSchema = z.enum([
 	'credential',
 	'workflow',
@@ -8,6 +11,7 @@ const FileTypeSchema = z.enum([
 	'file',
 	'folders',
 	'project',
+	'datatable',
 ]);
 export const SOURCE_CONTROL_FILE_TYPE = FileTypeSchema.Values;
 
@@ -49,7 +53,16 @@ export const SourceControlledFileSchema = z.object({
 	conflict: z.boolean(),
 	updatedAt: z.string(),
 	pushed: z.boolean().optional(),
+	isLocalPublished: z.boolean().optional(),
+	isRemoteArchived: z.boolean().optional(),
+	parentFolderId: z.string().nullable().optional(),
+	folderPath: z.array(z.string()).optional(),
+	remoteFolderPath: z.array(z.string()).optional(),
 	owner: ResourceOwnerSchema.optional(), // Resource owner can be a personal email or team information
+	publishingError: z.string().optional(),
+	publishingErrorDetails: workflowPublishBlockedDetailsSchema.optional(),
+	/** Advisory only — never blocks the pull. */
+	contentImportPolicy: contentImportPolicyResultSchema.optional(),
 });
 
 export type SourceControlledFile = z.infer<typeof SourceControlledFileSchema>;

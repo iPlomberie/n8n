@@ -1,6 +1,5 @@
 import { Logger } from '@n8n/backend-common';
 import { Service } from '@n8n/di';
-import { Constants, IdentityProvider } from 'samlify';
 import type { IdentityProviderInstance } from 'samlify';
 import type { XMLFileInfo, XMLLintOptions, XMLValidationResult } from 'xmllint-wasm';
 
@@ -20,13 +19,20 @@ export class SamlValidator {
 		validateXML: (options: XMLLintOptions) => Promise<XMLValidationResult>;
 	};
 
+	// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+	private samlify: typeof import('samlify');
+
 	async init() {
+		if (this.samlify) return;
+		this.samlify = await import('samlify');
 		await this.loadSchemas();
 		this.xmllint = await import('xmllint-wasm');
 	}
 
-	validateIdentiyProvider(idp: IdentityProviderInstance) {
-		const binding = idp.entityMeta.getSingleSignOnService(Constants.wording.binding.redirect);
+	validateIdentityProvider(idp: IdentityProviderInstance) {
+		const binding = idp.entityMeta.getSingleSignOnService(
+			this.samlify.Constants.wording.binding.redirect,
+		);
 		if (typeof binding !== 'string') {
 			throw new InvalidSamlMetadataError('only SAML redirect binding is supported.');
 		}
@@ -36,10 +42,10 @@ export class SamlValidator {
 		const validXML = await this.validateXml('metadata', metadata);
 
 		if (validXML) {
-			const idp = IdentityProvider({
+			const idp = this.samlify.IdentityProvider({
 				metadata,
 			});
-			this.validateIdentiyProvider(idp);
+			this.validateIdentityProvider(idp);
 		}
 
 		return validXML;
@@ -51,24 +57,24 @@ export class SamlValidator {
 
 	// dynamically load schema files
 	private async loadSchemas(): Promise<void> {
-		this.xmlProtocol = (await import('./schema/saml-schema-protocol-2.0.xsd')).xmlFileInfo;
-		this.xmlMetadata = (await import('./schema/saml-schema-metadata-2.0.xsd')).xmlFileInfo;
+		this.xmlProtocol = (await import('./schema/saml-schema-protocol-2.0.xsd.js')).xmlFileInfo;
+		this.xmlMetadata = (await import('./schema/saml-schema-metadata-2.0.xsd.js')).xmlFileInfo;
 		this.preload = (
 			await Promise.all([
 				// SAML
-				import('./schema/saml-schema-assertion-2.0.xsd'),
-				import('./schema/xmldsig-core-schema.xsd'),
-				import('./schema/xenc-schema.xsd'),
-				import('./schema/xml.xsd'),
+				import('./schema/saml-schema-assertion-2.0.xsd.js'),
+				import('./schema/xmldsig-core-schema.xsd.js'),
+				import('./schema/xenc-schema.xsd.js'),
+				import('./schema/xml.xsd.js'),
 
 				// WS-Federation
-				import('./schema/ws-federation.xsd'),
-				import('./schema/oasis-200401-wss-wssecurity-secext-1.0.xsd'),
-				import('./schema/oasis-200401-wss-wssecurity-utility-1.0.xsd'),
-				import('./schema/ws-addr.xsd'),
-				import('./schema/metadata-exchange.xsd'),
-				import('./schema/ws-securitypolicy-1.2.xsd'),
-				import('./schema/ws-authorization.xsd'),
+				import('./schema/ws-federation.xsd.js'),
+				import('./schema/oasis-200401-wss-wssecurity-secext-1.0.xsd.js'),
+				import('./schema/oasis-200401-wss-wssecurity-utility-1.0.xsd.js'),
+				import('./schema/ws-addr.xsd.js'),
+				import('./schema/metadata-exchange.xsd.js'),
+				import('./schema/ws-securitypolicy-1.2.xsd.js'),
+				import('./schema/ws-authorization.xsd.js'),
 			])
 		).map((m) => m.xmlFileInfo);
 	}

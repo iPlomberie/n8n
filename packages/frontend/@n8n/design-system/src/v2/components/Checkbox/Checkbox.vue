@@ -1,11 +1,10 @@
 <script setup lang="ts">
-import { reactiveOmit, reactivePick } from '@vueuse/core';
+import { reactivePick } from '@vueuse/core';
 import { CheckboxIndicator, CheckboxRoot, Label, Primitive, useForwardProps } from 'reka-ui';
 import { computed, useAttrs, useId } from 'vue';
 
-import Icon from '@n8n/design-system/components/N8nIcon/Icon.vue';
-
 import type { CheckboxEmits, CheckboxProps, CheckboxSlots } from './Checkbox.types';
+import Icon from '../../../components/N8nIcon/Icon.vue';
 
 defineOptions({ inheritAttrs: false });
 
@@ -20,8 +19,11 @@ const modelValue = defineModel<boolean>({ default: undefined });
 const computedValue = computed(() => (props.indeterminate ? 'indeterminate' : modelValue.value));
 
 const attrs = useAttrs();
-const primitiveClass = computed(() => attrs.class);
-const rootAttrs = computed(() => reactiveOmit(attrs, ['class']));
+const getRootAttrs = () => {
+	const rootAttrs = { ...attrs };
+	delete rootAttrs.class;
+	return rootAttrs;
+};
 
 function onUpdate(value: boolean | 'indeterminate') {
 	// @ts-expect-error - 'target' does not exist in type 'EventInit'
@@ -31,14 +33,10 @@ function onUpdate(value: boolean | 'indeterminate') {
 </script>
 
 <template>
-	<Primitive
-		:as
-		:class="[$style.checkbox, primitiveClass]"
-		:data-disabled="disabled ? '' : undefined"
-	>
+	<Primitive :as :class="[$style.checkbox, attrs.class]" :data-disabled="disabled ? '' : undefined">
 		<CheckboxRoot
 			:id="uuid"
-			v-bind="{ ...rootProps, ...rootAttrs }"
+			v-bind="{ ...rootProps, ...getRootAttrs() }"
 			:model-value="computedValue"
 			:name="name"
 			:disabled="disabled"
@@ -66,8 +64,8 @@ function onUpdate(value: boolean | 'indeterminate') {
 <style lang="css" module>
 .checkbox {
 	display: inline-flex;
-	align-items: center;
 	flex-direction: row;
+	gap: var(--spacing--2xs);
 	cursor: pointer;
 	color: white;
 	&[data-disabled] {
@@ -76,10 +74,11 @@ function onUpdate(value: boolean | 'indeterminate') {
 }
 
 .checkboxRoot {
+	position: relative;
 	background: transparent;
 	width: 16px;
 	height: 16px;
-	border-radius: 4px;
+	border-radius: var(--radius);
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -107,18 +106,20 @@ function onUpdate(value: boolean | 'indeterminate') {
 }
 
 .checkboxIndicator {
+	position: absolute;
 	display: flex;
 	align-items: center;
-	flex-direction: row;
+	justify-content: center;
 }
 
 .label {
-	padding-left: 15px;
-	font-size: 15px;
-	line-height: 1;
-	cursor: inherit;
-	color: var(--color--text--shade-1);
 	flex: 1;
+	padding-top: 1px;
+	font-size: var(--checkbox--label--font-size, var(--font-size--sm));
+	line-height: 1;
+	color: var(--color--text--shade-1);
+	cursor: inherit;
+
 	&[data-disabled] {
 		color: var(--color--text--tint-1);
 	}

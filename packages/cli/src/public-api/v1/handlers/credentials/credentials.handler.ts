@@ -1,106 +1,264 @@
-/* eslint-disable @typescript-eslint/no-unsafe-argument */
 import { LicenseState } from '@n8n/backend-common';
-import type { CredentialsEntity } from '@n8n/db';
+import type { CredentialsEntity, ICredentialsDb, User } from '@n8n/db';
 import { Container } from '@n8n/di';
 import { hasGlobalScope } from '@n8n/permissions';
-import type express from 'express';
+import type { ICredentialDataDecryptedObject } from 'n8n-workflow';
 import { z } from 'zod';
 
 import { CredentialTypes } from '@/credential-types';
+import { CredentialsFinderService } from '@/credentials/credentials-finder.service';
+import { CredentialsService } from '@/credentials/credentials.service';
 import { EnterpriseCredentialsService } from '@/credentials/credentials.service.ee';
 import { CredentialsHelper } from '@/credentials-helper';
+import { CredentialNotFoundError } from '@/errors/credential-not-found.error';
+import { BadRequestError } from '@/errors/response-errors/bad-request.error';
+import { ForbiddenError } from '@/errors/response-errors/forbidden.error';
+import { NotFoundError } from '@/errors/response-errors/not-found.error';
+import { EventService } from '@/events/event.service';
 
+import { toPublicApiCredentialResponse } from './credentials.mapper';
 import {
 	validCredentialsProperties,
 	validCredentialType,
 	validCredentialTypeForUpdate,
 	validCredentialsPropertiesForUpdate,
 } from './credentials.middleware';
-import {
-	createCredential,
-	CredentialsIsNotUpdatableError,
-	encryptCredential,
-	getCredentials,
-	getSharedCredentials,
-	removeCredential,
-	sanitizeCredentials,
-	saveCredential,
-	toJsonSchema,
-	updateCredential,
-} from './credentials.service';
+import { sanitizeCredentials, toJsonSchema } from './credentials.utils';
 import type { CredentialTypeRequest, CredentialRequest } from '../../../types';
-import { apiKeyHasScope, projectScope } from '../../shared/middlewares/global.middleware';
+import type { PublicAPIEndpoint } from '../../shared/handler.types';
+import { publicApiScope, projectScope } from '../../shared/middlewares/global.middleware';
 
-export = {
+async function buildUpdatePayload({
+	credentialsService,
+	user,
+	existingCredential,
+	body,
+	clearOauthTokenData,
+}: {
+	credentialsService: CredentialsService;
+	user: User;
+	existingCredential: CredentialsEntity;
+	body: {
+		name?: string;
+		type?: string;
+		data?: ICredentialDataDecryptedObject;
+		isGlobal?: boolean;
+		isResolvable?: boolean;
+		isPartialData?: boolean;
+	};
+	clearOauthTokenData: boolean;
+}): Promise<{
+	updatePayload: ICredentialsDb;
+	decryptedDataForDeps?: ICredentialDataDecryptedObject;
+}> {
+	let updatePayload: ICredentialsDb;
+	let decryptedDataForDeps: ICredentialDataDecryptedObject | undefined;
+
+	if (body.data) {
+		const preparedCredentialData = await credentialsService.prepareUpdateData(
+			user,
+			{
+				name: body.name ?? existingCredential.name,
+				type: body.type ?? existingCredential.type,
+				data: body.data,
+			},
+			existingCredential,
+			{
+				dataMerge: body.isPartialData ? 'partial' : 'replace',
+				clearOauthTokenData,
+			},
+		);
+
+		decryptedDataForDeps = preparedCredentialData.data as unknown as ICredentialDataDecryptedObject;
+
+		updatePayload = await credentialsService.createEncryptedData({
+			id: existingCredential.id,
+			name: preparedCredentialData.name,
+			type: preparedCredentialData.type,
+			data: decryptedDataForDeps,
+		});
+	} else {
+		updatePayload = {
+			id: existingCredential.id,
+			name: body.name ?? existingCredential.name,
+			type: body.type ?? existingCredential.type,
+			data: existingCredential.data,
+			createdAt: existingCredential.createdAt,
+			updatedAt: existingCredential.updatedAt,
+		};
+	}
+
+	if (body.isGlobal !== undefined) {
+		updatePayload.isGlobal = body.isGlobal;
+	}
+	if (body.isResolvable !== undefined) {
+		updatePayload.isResolvable = body.isResolvable;
+	}
+	updatePayload.updatedAt = new Date();
+
+	return { updatePayload, decryptedDataForDeps };
+}
+
+type CredentialsHandlers = {
+	testCredential: PublicAPIEndpoint<CredentialRequest.Test>;
+	createCredential: PublicAPIEndpoint<CredentialRequest.Create>;
+	updateCredential: PublicAPIEndpoint<CredentialRequest.Update>;
+	transferCredential: PublicAPIEndpoint<CredentialRequest.Transfer>;
+	deleteCredential: PublicAPIEndpoint<CredentialRequest.Delete>;
+	getCredentialType: PublicAPIEndpoint<CredentialTypeRequest.Get>;
+};
+
+const credentialsHandlers: CredentialsHandlers = {
+	testCredential: [
+		publicApiScope('credential:read'),
+		projectScope('credential:read', 'credential'),
+		async (req, res) => {
+			const { id: credentialId } = req.params;
+			try {
+				const credentialTestResult = await Container.get(CredentialsService).testById(
+					req.user.id,
+					credentialId,
+				);
+				return res.json(credentialTestResult);
+			} catch (error) {
+				if (error instanceof CredentialNotFoundError) {
+					throw new NotFoundError(error.message);
+				}
+
+				throw error;
+			}
+		},
+	],
 	createCredential: [
 		validCredentialType,
 		validCredentialsProperties,
-		apiKeyHasScope('credential:create'),
-		async (
-			req: CredentialRequest.Create,
-			res: express.Response,
-		): Promise<express.Response<Partial<CredentialsEntity>>> => {
-			try {
-				const newCredential = await createCredential(req.body);
+		publicApiScope('credential:create'),
+		async (req, res) => {
+			const credentialsService = Container.get(CredentialsService);
+			const { scopes: _scopes, ...credential } = await credentialsService.createUnmanagedCredential(
+				{
+					type: req.body.type,
+					name: req.body.name,
+					data: req.body.data,
+					projectId: req.body.projectId,
+					isResolvable: req.body.isResolvable,
+					usageScope: 'project',
+				},
+				req.user,
+			);
 
-				const encryptedData = await encryptCredential(newCredential);
+			const project = await credentialsService.findCredentialOwningProject(credential.id);
 
-				Object.assign(newCredential, encryptedData);
+			Container.get(EventService).emit('credentials-created', {
+				user: req.user,
+				credentialType: credential.type,
+				credentialId: credential.id,
+				credentialName: credential.name,
+				publicApi: true,
+				projectId: project?.id,
+				projectType: project?.type,
+				isDynamic: credential.isResolvable ?? false,
+				jweEnabled: req.body.data.jweEnabled === true,
+			});
 
-				const savedCredential = await saveCredential(newCredential, req.user, encryptedData);
-
-				return res.json(sanitizeCredentials(savedCredential));
-			} catch ({ message, httpStatusCode }) {
-				// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-				return res.status(httpStatusCode ?? 500).json({ message });
-			}
+			return res.json(
+				toPublicApiCredentialResponse({
+					id: credential.id,
+					name: credential.name,
+					type: credential.type,
+					isManaged: credential.isManaged,
+					isGlobal: credential.isGlobal,
+					isResolvable: credential.isResolvable,
+					resolvableAllowFallback: credential.resolvableAllowFallback,
+					resolverId: credential.resolverId,
+					createdAt: credential.createdAt,
+					updatedAt: credential.updatedAt,
+				}),
+			);
 		},
 	],
 	updateCredential: [
 		validCredentialTypeForUpdate,
 		validCredentialsPropertiesForUpdate,
-		apiKeyHasScope('credential:update'),
+		publicApiScope('credential:update'),
 		projectScope('credential:update', 'credential'),
-		async (
-			req: CredentialRequest.Update,
-			res: express.Response,
-		): Promise<express.Response<Partial<CredentialsEntity>>> => {
+		async (req, res) => {
 			const { id: credentialId } = req.params;
+			const credentialsService = Container.get(CredentialsService);
 
-			if (req.body.isGlobal !== undefined) {
+			const existingCredential = await Container.get(CredentialsFinderService).findById(
+				credentialId,
+				{ includeSharedProject: true },
+			);
+			if (!existingCredential) {
+				throw new NotFoundError('Credential not found');
+			}
+
+			if (existingCredential.isManaged) {
+				throw new BadRequestError('Managed credentials cannot be updated.');
+			}
+
+			if (req.body.isGlobal !== undefined && req.body.isGlobal !== existingCredential.isGlobal) {
 				if (!Container.get(LicenseState).isSharingLicensed()) {
-					return res.status(403).json({ message: 'You are not licensed for sharing credentials' });
+					throw new ForbiddenError('You are not licensed for sharing credentials');
 				}
 
 				const canShareGlobally = hasGlobalScope(req.user, 'credential:shareGlobally');
 				if (!canShareGlobally) {
-					return res.status(403).json({
-						message: 'You do not have permission to change global sharing for credentials',
-					});
+					throw new ForbiddenError(
+						'You do not have permission to change global sharing for credentials',
+					);
 				}
 			}
 
-			try {
-				const updatedCredential = await updateCredential(credentialId, req.body);
-
-				if (!updatedCredential) {
-					return res.status(404).json({ message: 'Credential not found' });
+			if (
+				req.body.isResolvable !== undefined &&
+				req.body.isResolvable !== Boolean(existingCredential.isResolvable)
+			) {
+				const ownerSharing = existingCredential.shared?.find(
+					(sharing) => sharing.role === 'credential:owner',
+				);
+				if (req.body.isResolvable) {
+					Container.get(CredentialsService).ensureEndUserCredentialAllowedInProject(
+						ownerSharing?.project,
+					);
 				}
-
-				return res.json(sanitizeCredentials(updatedCredential as CredentialsEntity));
-			} catch (error) {
-				if (error instanceof CredentialsIsNotUpdatableError) {
-					return res.status(400).json({ message: error.message });
-				}
-				const message = error instanceof Error ? error.message : 'Unknown error';
-				return res.status(500).json({ message });
+				await Container.get(CredentialsService).ensureCanManageEndUserCredential(
+					req.user,
+					ownerSharing?.projectId,
+				);
 			}
+
+			const isChangingAuthType =
+				req.body.type !== undefined && req.body.type !== existingCredential.type;
+			const isTogglingToPrivate =
+				Boolean(req.body.isResolvable) && !existingCredential.isResolvable;
+
+			const { updatePayload, decryptedDataForDeps } = await buildUpdatePayload({
+				credentialsService,
+				user: req.user,
+				existingCredential,
+				body: req.body,
+				clearOauthTokenData: isTogglingToPrivate || isChangingAuthType,
+			});
+
+			const updatedCredential = await credentialsService.update(
+				credentialId,
+				updatePayload,
+				decryptedDataForDeps,
+			);
+
+			if (!updatedCredential) {
+				throw new NotFoundError('Credential not found');
+			}
+
+			return res.json(toPublicApiCredentialResponse(updatedCredential));
 		},
 	],
 	transferCredential: [
-		apiKeyHasScope('credential:move'),
+		publicApiScope('credential:move'),
 		projectScope('credential:move', 'credential'),
-		async (req: CredentialRequest.Transfer, res: express.Response) => {
+		async (req, res) => {
 			const body = z.object({ destinationProjectId: z.string() }).parse(req.body);
 
 			await Container.get(EnterpriseCredentialsService).transferOne(
@@ -109,46 +267,38 @@ export = {
 				body.destinationProjectId,
 			);
 
-			res.status(204).send();
+			return res.status(204).send();
 		},
 	],
 	deleteCredential: [
-		apiKeyHasScope('credential:delete'),
+		publicApiScope('credential:delete'),
 		projectScope('credential:delete', 'credential'),
-		async (
-			req: CredentialRequest.Delete,
-			res: express.Response,
-		): Promise<express.Response<Partial<CredentialsEntity>>> => {
+		async (req, res) => {
 			const { id: credentialId } = req.params;
-			let credential: CredentialsEntity | undefined;
 
-			if (!['global:owner', 'global:admin'].includes(req.user.role.slug)) {
-				const shared = await getSharedCredentials(req.user.id, credentialId);
-
-				if (shared?.role === 'credential:owner') {
-					credential = shared.credentials;
-				}
-			} else {
-				credential = (await getCredentials(credentialId)) as CredentialsEntity;
-			}
+			const credential = await Container.get(CredentialsFinderService).findCredentialForUser(
+				credentialId,
+				req.user,
+				['credential:delete'],
+			);
 
 			if (!credential) {
-				return res.status(404).json({ message: 'Not Found' });
+				throw new NotFoundError('Not Found');
 			}
 
-			await removeCredential(req.user, credential);
+			await Container.get(CredentialsService).delete(req.user, credentialId);
 			return res.json(sanitizeCredentials(credential));
 		},
 	],
 
 	getCredentialType: [
-		async (req: CredentialTypeRequest.Get, res: express.Response): Promise<express.Response> => {
+		async (req, res) => {
 			const { credentialTypeName } = req.params;
 
 			try {
 				Container.get(CredentialTypes).getByName(credentialTypeName);
 			} catch (error) {
-				return res.status(404).json({ message: 'Not Found' });
+				throw new NotFoundError('Not Found');
 			}
 
 			const schema = Container.get(CredentialsHelper)
@@ -159,3 +309,5 @@ export = {
 		},
 	],
 };
+
+export = credentialsHandlers;

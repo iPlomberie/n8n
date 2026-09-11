@@ -1,17 +1,29 @@
 import type { CurrentsFixtures, CurrentsWorkerFixtures } from '@currents/playwright';
 import { fixtures as currentsFixtures } from '@currents/playwright';
 import { test as base, expect, request } from '@playwright/test';
+import type { ServiceHelpers } from 'n8n-containers/services/types';
 import type { N8NConfig, N8NStack } from 'n8n-containers/stack';
 import { createN8NStack } from 'n8n-containers/stack';
 
-import { CAPABILITIES, type Capability } from './capabilities';
+import { a11yFixtures, type A11yTestFixtures } from './a11y';
+import {
+	CAPABILITIES,
+	shouldSkipContainerRequirement,
+	type CapabilityOption,
+} from './capabilities';
 import { consoleErrorFixtures } from './console-error-monitor';
 import { N8N_AUTH_COOKIE } from '../config/constants';
 import { setupDefaultInterceptors } from '../config/intercepts';
+import { backendV8CoverageFixtures } from '../fixtures/backend-v8-coverage';
 import { observabilityFixtures, type ObservabilityTestFixtures } from '../fixtures/observability';
+import {
+	quarantineFixtures,
+	type QuarantineTestFixtures,
+	type QuarantineWorkerFixtures,
+} from '../fixtures/quarantine';
+import { v8CoverageFixtures } from '../fixtures/v8-coverage';
 import { n8nPage } from '../pages/n8nPage';
 import { ApiHelpers } from '../services/api-helper';
-import { ProxyServer } from '../services/proxy-server';
 import { TestError, type TestRequirements } from '../Types';
 import { setupTestRequirements } from '../utils/requirements';
 import { getBackendUrl, getFrontendUrl } from '../utils/url-helper';
@@ -21,43 +33,95 @@ type TestFixtures = {
 	api: ApiHelpers;
 	baseURL: string;
 	setupRequirements: (requirements: TestRequirements) => Promise<void>;
-	proxyServer: ProxyServer;
+	/** Type-safe service helpers (mailpit, gitea, proxy, observability, etc.) */
+	services: ServiceHelpers;
+	/**
+	 * Direct URLs to each main instance (bypasses load balancer).
+	 * Only available in container mode with multi-main setup.
+	 * Index 0 = main-1, Index 1 = main-2, etc.
+	 */
+	mainUrls: string[];
+	/**
+	 * Create an API helper for a specific main instance (bypasses load balancer).
+	 * Useful for multi-main testing scenarios.
+	 * @param mainIndex - 0-based index of the main (0 = main-1, 1 = main-2, etc.)
+	 */
+	createApiForMain: (mainIndex: number) => Promise<ApiHelpers>;
+	/** Internal auto fixture: per-spec backend V8 coverage (DEVP-370). No-op
+	 *  unless COVERAGE_ENABLED. */
+	backendCoverage: undefined;
+	containerRequirement: undefined;
 };
 
 type WorkerFixtures = {
 	n8nUrl: string;
 	backendUrl: string;
 	frontendUrl: string;
+	internalUrl: string;
 	dbSetup: undefined;
+	n8nStackConfig: N8NConfig;
 	n8nContainer: N8NStack;
 	capability?: CapabilityOption;
 };
 
-type CapabilityOption = Capability | N8NConfig;
 type ProjectUse = { containerConfig?: N8NConfig };
 
+function parseGlobalTestEnv(): Record<string, string> {
+	const raw = process.env.N8N_TEST_ENV;
+	if (!raw) return {};
+	try {
+		return JSON.parse(raw) as Record<string, string>;
+	} catch {
+		console.warn('[base.ts] Failed to parse N8N_TEST_ENV');
+		return {};
+	}
+}
+
+function logKeepalive(container: N8NStack): void {
+	console.log('\n=== KEEPALIVE: Containers left running for debugging ===');
+	console.log(`    URL: ${container.baseUrl}`);
+	console.log(`    Project: ${container.projectName}`);
+	console.log('    Cleanup: pnpm --filter n8n-containers stack:clean:all');
+	console.log('=========================================================\n');
+}
+
 export const test = base.extend<
-	TestFixtures & CurrentsFixtures & ObservabilityTestFixtures,
-	WorkerFixtures & CurrentsWorkerFixtures
+	TestFixtures &
+		CurrentsFixtures &
+		ObservabilityTestFixtures &
+		QuarantineTestFixtures &
+		A11yTestFixtures,
+	WorkerFixtures & CurrentsWorkerFixtures & QuarantineWorkerFixtures
 >({
 	...currentsFixtures.baseFixtures,
-	...currentsFixtures.coverageFixtures,
+	...v8CoverageFixtures,
+	...backendV8CoverageFixtures,
 	...currentsFixtures.actionFixtures,
 	...observabilityFixtures,
 	...consoleErrorFixtures,
+	...quarantineFixtures,
+	...a11yFixtures,
 
 	// Option for test.use({ capability: 'proxy' }) - transformed into N8NStack by n8nContainer
 	capability: [undefined, { scope: 'worker', option: true }],
 
-	// Creates container from: project.containerConfig (base) + capability (override)
-	// When N8N_BASE_URL is set, skips container creation for local testing
-	n8nContainer: [
-		async ({ capability }, use, workerInfo) => {
-			if (getBackendUrl()) {
-				await use(null!);
-				return;
-			}
+	// Service requirements now come from test.use(), so local projects cannot filter them by title.
+	containerRequirement: [
+		async ({ capability }, use, testInfo) => {
+			testInfo.skip(
+				shouldSkipContainerRequirement(capability, !!getBackendUrl()),
+				'This test requires container services',
+			);
+			await use(undefined);
+		},
+		{ auto: true },
+	],
 
+	// Resolves the effective N8NConfig from project.containerConfig (base) +
+	// capability (override) + N8N_TEST_ENV (global). Topology-neutral: it
+	// always produces a config, even when a container will not be provisioned.
+	n8nStackConfig: [
+		async ({ capability }, use, workerInfo) => {
 			const { containerConfig: base = {} } = workerInfo.project.use as ProjectUse;
 			const override: N8NConfig = !capability
 				? {}
@@ -65,22 +129,43 @@ export const test = base.extend<
 					? CAPABILITIES[capability]
 					: capability;
 
+			const globalEnv = parseGlobalTestEnv();
+
 			const config: N8NConfig = {
 				...base,
 				...override,
 				services: [...new Set([...(base.services ?? []), ...(override.services ?? [])])],
-				env: { ...base.env, ...override.env, E2E_TESTS: 'true', N8N_RESTRICT_FILE_ACCESS_TO: '' },
+				env: {
+					...globalEnv,
+					...base.env,
+					...override.env,
+					E2E_TESTS: 'true',
+					N8N_RESTRICT_FILE_ACCESS_TO: '',
+				},
+				// Coverage pipeline opt-in: when the coverage runner sets N8N_COVERAGE_DIR,
+				// bridge it to the stack's typed config so containers collect V8 coverage.
+				...(process.env.N8N_COVERAGE_DIR ? { coverageHostDir: process.env.N8N_COVERAGE_DIR } : {}),
 			};
 
-			const container = await createN8NStack(config);
+			await use(config);
+		},
+		{ scope: 'worker', box: true },
+	],
+
+	// Creates container from n8nStackConfig.
+	// When N8N_BASE_URL is set, skips container creation for local testing.
+	n8nContainer: [
+		async ({ n8nStackConfig }, use) => {
+			if (getBackendUrl()) {
+				await use(null!);
+				return;
+			}
+
+			const container = await createN8NStack(n8nStackConfig);
 			await use(container);
 
 			if (process.env.N8N_CONTAINERS_KEEPALIVE === 'true') {
-				console.log('\n=== KEEPALIVE: Containers left running for debugging ===');
-				console.log(`    URL: ${container.baseUrl}`);
-				console.log(`    Project: ${container.projectName}`);
-				console.log('    Cleanup: pnpm --filter n8n-containers stack:clean:all');
-				console.log('=========================================================\n');
+				logKeepalive(container);
 				return;
 			}
 
@@ -113,6 +198,18 @@ export const test = base.extend<
 		{ scope: 'worker' },
 	],
 
+	// The n8n URL as seen from *inside* the stack, for specs that make n8n itself
+	// call it (an HTTP Request node, a webhook destination). Under container
+	// projects the node runs in a main or worker container, where the host-mapped
+	// `backendUrl` port does not exist - use the network alias instead. Locally
+	// there are no containers and n8n shares the host's loopback, so they match.
+	internalUrl: [
+		async ({ n8nContainer, backendUrl }, use) => {
+			await use(n8nContainer?.internalMainUrls[0] ?? backendUrl);
+		},
+		{ scope: 'worker' },
+	],
+
 	dbSetup: [
 		async ({ n8nContainer }, use) => {
 			if (n8nContainer) {
@@ -135,6 +232,12 @@ export const test = base.extend<
 	n8n: async ({ context, backendUrl, frontendUrl }, use, testInfo) => {
 		await setupDefaultInterceptors(context);
 		const page = await context.newPage();
+
+		// Set debounce multiplier for E2E tests - 1 means normal timing (no change)
+		// Can be lowered (e.g. 0.5) to speed up tests, but avoid 0 as it causes race conditions
+		await page.addInitScript(() => {
+			sessionStorage.setItem('N8N_DEBOUNCE_MULTIPLIER', '1');
+		});
 
 		const useSeparateApiContext = backendUrl !== frontendUrl;
 
@@ -212,6 +315,48 @@ export const test = base.extend<
 		await context.dispose();
 	},
 
+	mainUrls: async ({ n8nContainer }, use) => {
+		const urls = n8nContainer?.mainUrls ?? [];
+		await use(urls);
+	},
+
+	createApiForMain: async ({ n8nContainer }, use, testInfo) => {
+		const contexts: Array<{ dispose: () => Promise<void> }> = [];
+
+		const createApi = async (mainIndex: number): Promise<ApiHelpers> => {
+			const mainUrls = n8nContainer?.mainUrls ?? [];
+			if (mainIndex < 0 || mainIndex >= mainUrls.length) {
+				throw new TestError(
+					`Invalid main index ${mainIndex}. Available mains: ${mainUrls.length}. ` +
+						'Ensure you are running in multi-main container mode.',
+				);
+			}
+
+			const context = await request.newContext({ baseURL: mainUrls[mainIndex] });
+			contexts.push(context);
+
+			const api = new ApiHelpers(context);
+			await api.setupFromTags(testInfo.tags.filter((tag) => tag.toLowerCase() !== '@db:reset'));
+
+			const hasAuthTag = testInfo.tags.some((tag) => tag.startsWith('@auth:'));
+			const apiCookies = await context.storageState();
+			const authCookie = apiCookies.cookies.find((cookie) => cookie.name === N8N_AUTH_COOKIE);
+
+			if (!hasAuthTag && !authCookie) {
+				await api.signin('owner');
+			}
+
+			return api;
+		};
+
+		await use(createApi);
+
+		// Cleanup all created contexts
+		for (const ctx of contexts) {
+			await ctx.dispose();
+		}
+	},
+
 	setupRequirements: async ({ n8n, context }, use) => {
 		const setupFunction = async (requirements: TestRequirements): Promise<void> => {
 			await setupTestRequirements(n8n, context, requirements);
@@ -220,39 +365,24 @@ export const test = base.extend<
 		await use(setupFunction);
 	},
 
-	proxyServer: async ({ n8nContainer }, use) => {
-		if (!n8nContainer) {
-			throw new TestError(
-				'Testing with Proxy server is not supported when using N8N_BASE_URL environment variable. Remove N8N_BASE_URL to use containerized testing.',
-			);
-		}
-
-		const proxyServerContainer = n8nContainer.containers.find((container) =>
-			container.getName().endsWith('proxyserver'),
-		);
-
-		if (!proxyServerContainer) {
-			throw new TestError('Proxy server container not initialized. Cannot initialize client.');
-		}
-
-		const serverUrl = `http://${proxyServerContainer?.getHost()}:${proxyServerContainer?.getFirstMappedPort()}`;
-		const proxyServer = new ProxyServer(serverUrl);
-
-		await use(proxyServer);
+	services: async ({ n8nContainer }, use) => {
+		await use(n8nContainer.services);
 	},
 });
 
 export { expect };
+export { A11Y_BUCKETS, DEFAULT_A11Y_TAGS } from './a11y';
+export type { A11yBucket, A11yCheckOptions, A11yViolation } from './a11y';
 
 /*
 Fixture Dependency Graph:
-Worker: capability + project.containerConfig → n8nContainer → [backendUrl, frontendUrl, dbSetup]
+Worker: capability + project.containerConfig → n8nStackConfig → n8nContainer → [backendUrl, frontendUrl, dbSetup]
 Test:   frontendUrl + dbSetup → baseURL → n8n (uses backendUrl for API calls)
         backendUrl → api
+        n8nContainer → services
+        n8n → a11y
 
-n8nContainer provides unified access to:
-- services: Type-safe helpers (mailpit, gitea, observability, etc.)
-- logs/metrics: Shortcuts for observability queries
-- findContainers/stopContainer: Container operations for chaos testing
-- serviceResults: Raw service results (advanced use)
+n8nStackConfig: Resolved N8NConfig (topology-neutral, always produced)
+n8nContainer:   Container lifecycle (stop, containers, mainUrls, etc.)
+services:       Type-safe helpers (mailpit, gitea, proxy, observability, etc.)
 */

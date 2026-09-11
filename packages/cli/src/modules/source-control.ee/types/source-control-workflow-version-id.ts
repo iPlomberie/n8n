@@ -5,9 +5,12 @@ export interface SourceControlWorkflowVersionId {
 	versionId: string;
 	filename: string;
 	name?: string;
+	/** `undefined` when the remote file predates description syncing. */
+	description?: string | null;
 	localId?: string;
 	remoteId?: string;
 	parentFolderId: string | null;
 	updatedAt?: string;
 	owner?: StatusResourceOwner;
+	isRemoteArchived?: boolean;
 }

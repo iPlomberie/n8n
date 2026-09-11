@@ -6,6 +6,7 @@ import type {
 	INode,
 	INodeParameters,
 	IWorkflowBase,
+	IWorkflowGroup,
 	NodeParameterValueType,
 } from '.';
 import { compareConnections, type ConnectionsDiff } from './connections-diff';
@@ -21,6 +22,7 @@ export type DiffableWorkflow<N extends DiffableNode = DiffableNode> = {
 	connections: IConnections;
 	createdAt: Date;
 	authors?: string;
+	nodeGroups?: IWorkflowGroup[];
 };
 
 export const enum NodeDiffStatus {
@@ -35,13 +37,33 @@ export type NodeDiff<T> = {
 	node: T;
 };
 
-export type WorkflowDiff<T> = Map<string, NodeDiff<T>>;
+export type WorkflowDiff<T> = Map<INode['id'], NodeDiff<T>>;
 
 export function compareNodes<T extends DiffableNode>(
 	base: T | undefined,
 	target: T | undefined,
 ): boolean {
-	const propsToCompare = ['name', 'type', 'typeVersion', 'webhookId', 'credentials', 'parameters'];
+	// All persisted node fields except `position` — moving a node on the canvas
+	// is not a content change. Kept as an allowlist because callers pass UI node
+	// objects that carry ephemeral fields (e.g. `issues`).
+	const propsToCompare = [
+		'name',
+		'type',
+		'typeVersion',
+		'webhookId',
+		'credentials',
+		'parameters',
+		'disabled',
+		'notes',
+		'notesInFlow',
+		'onError',
+		'continueOnFail',
+		'retryOnFail',
+		'maxTries',
+		'waitBetweenTries',
+		'alwaysOutputData',
+		'executeOnce',
+	];
 
 	const baseNode = pick(base, propsToCompare);
 	const targetNode = pick(target, propsToCompare);
@@ -102,6 +124,57 @@ export class WorkflowChangeSet<T extends DiffableNode> {
 		}
 	}
 }
+
+/**
+ * Returns true if `s` contains all characters of `substr` in order
+ * e.g. s='abcde'
+ * substr:
+ *  'abde' -> true
+ *  'abcd' -> false
+ *  'abced' -> false
+ */
+export function stringContainsParts(s: string, substr: string) {
+	if (substr.length > s.length) return false;
+	const diffSize = s.length - substr.length;
+	let marker = 0;
+	for (let i = 0; i < s.length; ++i) {
+		if (substr[marker] === s[i]) marker++;
+
+		if (i - marker > diffSize) return false;
+	}
+	return marker >= substr.length;
+}
+
+export function parametersAreSuperset(prev: unknown, next: unknown): boolean {
+	if (typeof prev !== typeof next) return false;
+	if (typeof prev !== 'object' || !prev || !next) {
+		if (typeof prev === 'string') {
+			// We assert above that these are the same type
+			return stringContainsParts(next as string, prev);
+		}
+		return prev === next;
+	}
+
+	if (Array.isArray(prev)) {
+		if (!Array.isArray(next)) return false;
+		if (prev.length !== next.length) return false;
+		return prev.every((v, i) => parametersAreSuperset(v, next[i]));
+	}
+
+	const params = Object.keys(prev);
+
+	if (params.length !== Object.keys(next).length) return false;
+	// abort if keys differ
+	if (params.some((x) => !Object.prototype.hasOwnProperty.call(next, x))) return false;
+
+	return params.every((key) =>
+		parametersAreSuperset(
+			(prev as Record<string, unknown>)[key],
+			(next as Record<string, unknown>)[key],
+		),
+	);
+}
+
 /**
  * Determines whether the second node is a "superset" of the first one, i.e. whether no data
  * is lost if we were to replace `prev` with `next`.
@@ -110,7 +183,6 @@ export class WorkflowChangeSet<T extends DiffableNode> {
  * - Both nodes have the exact same keys
  * - All values are either strings where `next.x` contains `prev.x`, or hold the exact same value
  */
-
 function nodeIsSuperset<T extends DiffableNode>(prevNode: T, nextNode: T) {
 	const { parameters: prevParams, ...prev } = prevNode;
 	const { parameters: nextParams, ...next } = nextNode;
@@ -118,28 +190,40 @@ function nodeIsSuperset<T extends DiffableNode>(prevNode: T, nextNode: T) {
 	// abort if the nodes don't match besides parameters
 	if (!compareNodes({ ...prev, parameters: {} }, { ...next, parameters: {} })) return false;
 
-	const params = Object.keys(prevParams);
+	return parametersAreSuperset(prevParams, nextParams);
+}
 
-	// abort if keys differ
-	if (params.some((x) => !Object.prototype.hasOwnProperty.call(nextParams, x))) return false;
-	if (Object.keys(nextParams).some((x) => !Object.prototype.hasOwnProperty.call(prevParams, x)))
-		return false;
+/**
+ * Group changes are additive if they only add groups or group members,
+ * i.e. no existing group, group name or group member may be removed.
+ */
+function nodeGroupChangesAreAdditive<N extends DiffableNode>(
+	prev: DiffableWorkflow<N>,
+	next: DiffableWorkflow<N>,
+): boolean {
+	const nextGroupsById = new Map((next.nodeGroups ?? []).map((group) => [group.id, group]));
 
-	for (const key of params) {
-		const left = prevParams[key];
-		const right = nextParams[key];
-		// non-strings must be exactly equal to not be lost data
-		if (typeof left === 'string' && typeof right === 'string') {
-			// strings must only be contained in the new string
-			if (!right.includes(left)) return false;
-		} else if (left !== right) return false;
+	for (const prevGroup of prev.nodeGroups ?? []) {
+		const nextGroup = nextGroupsById.get(prevGroup.id);
+		if (
+			!nextGroup ||
+			nextGroup.name !== prevGroup.name ||
+			nextGroup.description !== prevGroup.description
+		) {
+			return false;
+		}
+
+		const nextNodeIds = new Set(nextGroup.nodeIds);
+		if (!prevGroup.nodeIds.every((id) => nextNodeIds.has(id))) {
+			return false;
+		}
 	}
 
 	return true;
 }
 
 function mergeAdditiveChanges<N extends DiffableNode = DiffableNode>(
-	_prev: DiffableWorkflow<N>,
+	prev: DiffableWorkflow<N>,
 	next: DiffableWorkflow<N>,
 	diff: WorkflowChangeSet<N>,
 ) {
@@ -152,6 +236,8 @@ function mergeAdditiveChanges<N extends DiffableNode = DiffableNode>(
 	}
 
 	if (Object.keys(diff.connections.removed).length > 0) return false;
+
+	if (!nodeGroupChangesAreAdditive(prev, next)) return false;
 
 	return true;
 }
@@ -241,7 +327,7 @@ export function determineNodeSize(parameters: INodeParameters | NodeParameterVal
 	} else if (typeof parameters !== 'object' || parameters instanceof Date) {
 		return 1;
 	} else if (Array.isArray(parameters)) {
-		return parameters.reduce<number>((acc, v) => acc + determineNodeSize(v as INodeParameters), 1);
+		return parameters.reduce<number>((acc, v) => acc + determineNodeSize(v), 1);
 	} else {
 		// Record case
 		return Object.values(parameters).reduce<number>(

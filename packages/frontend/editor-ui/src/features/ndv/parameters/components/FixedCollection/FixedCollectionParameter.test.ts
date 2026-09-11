@@ -7,11 +7,25 @@ import { setActivePinia } from 'pinia';
 import { COLLECTION_OVERHAUL_EXPERIMENT } from '@/app/constants';
 import { usePostHog, type PosthogStore } from '@/app/stores/posthog.store';
 import userEvent from '@testing-library/user-event';
+import { flushPromises } from '@vue/test-utils';
+
+// Instantiates a store that derives the workflow id from the route. These tests run
+// without a router, so resolve the id directly.
+vi.mock('@/app/composables/useWorkflowId', async () => {
+	const { computed } = await import('vue');
+	return {
+		useWorkflowId: () => computed(() => ''),
+		useRouteWorkflowId: () => computed(() => ''),
+	};
+});
 
 const mockedGetVariant = vi.fn(() => 'control');
 vi.mock('@/app/stores/posthog.store', () => ({
 	usePostHog: vi.fn(() => ({
 		getVariant: mockedGetVariant,
+		// Read by ParameterInputList's per-node experiment gating (e.g. Telegram HITL),
+		// which every parameter type mounts through, including this fixedCollection one.
+		isFeatureEnabled: vi.fn(() => false),
 	})),
 }));
 
@@ -69,10 +83,11 @@ describe('FixedCollectionParameter.vue (Wrapper)', () => {
 		vi.clearAllMocks();
 	});
 
-	it('renders legacy component when feature flag is disabled', () => {
+	it('renders legacy component when feature flag is disabled', async () => {
 		mockedGetVariant.mockReturnValue(COLLECTION_OVERHAUL_EXPERIMENT.control);
 
 		const { container } = renderComponent();
+		await flushPromises();
 
 		const component = container.querySelector('[data-test-id="fixed-collection-rules"]');
 		expect(component).toBeInTheDocument();
@@ -81,13 +96,15 @@ describe('FixedCollectionParameter.vue (Wrapper)', () => {
 		expect(addButton).toBeInTheDocument();
 	});
 
-	it('renders new component when feature flag is enabled', () => {
+	it('renders new component when feature flag is enabled', async () => {
 		const mockPostHog = vi.mocked(usePostHog);
 		mockPostHog.mockReturnValue({
 			getVariant: vi.fn().mockReturnValue(COLLECTION_OVERHAUL_EXPERIMENT.variant),
+			isFeatureEnabled: vi.fn(() => false),
 		} as Partial<PosthogStore> as PosthogStore);
 
 		const { container } = renderComponent();
+		await flushPromises();
 
 		// New component renders
 		const component = container.querySelector('[data-test-id="fixed-collection-rules"]');
@@ -99,7 +116,7 @@ describe('FixedCollectionParameter.vue (Wrapper)', () => {
 		expect(buttons.length).toBeGreaterThan(0);
 	});
 
-	it('forwards props to child component', () => {
+	it('forwards props to child component', async () => {
 		mockedGetVariant.mockReturnValue(COLLECTION_OVERHAUL_EXPERIMENT.variant);
 
 		const { container } = renderComponent({
@@ -108,6 +125,7 @@ describe('FixedCollectionParameter.vue (Wrapper)', () => {
 				isReadOnly: true,
 			},
 		});
+		await flushPromises();
 
 		// Verify that isReadOnly prop is forwarded (no add buttons should be visible)
 		const addButton = container.querySelector('[data-test-id="fixed-collection-add"]');
@@ -118,10 +136,12 @@ describe('FixedCollectionParameter.vue (Wrapper)', () => {
 		mockedGetVariant.mockReturnValue(COLLECTION_OVERHAUL_EXPERIMENT.variant);
 
 		const { emitted, getByTestId } = renderComponent();
+		await flushPromises();
 
 		// Click the add button to trigger a valueChanged event
 		const addButton = getByTestId('fixed-collection-add-header');
 		await userEvent.click(addButton);
+		await flushPromises();
 
 		// Verify that the valueChanged event was emitted with the correct payload
 		expect(emitted().valueChanged).toBeTruthy();

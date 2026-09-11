@@ -1,4 +1,5 @@
-import { LicenseState, Logger } from '@n8n/backend-common';
+import { Logger } from '@n8n/backend-common';
+import { OutboundHttp } from '@n8n/backend-network';
 import { OnPubSubEvent } from '@n8n/decorators';
 import { Service } from '@n8n/di';
 import type { DeleteResult } from '@n8n/typeorm';
@@ -38,8 +39,8 @@ export class LogStreamingDestinationService {
 		private readonly logger: Logger,
 		private readonly eventDestinationsRepository: EventDestinationsRepository,
 		private readonly eventBus: MessageEventBus,
-		private readonly licenseState: LicenseState,
 		private readonly publisher: Publisher,
+		private readonly outboundHttp: OutboundHttp,
 	) {
 		this.messageHandler = this.handleMessage.bind(this);
 	}
@@ -52,7 +53,11 @@ export class LogStreamingDestinationService {
 		if (savedEventDestinations.length > 0) {
 			for (const destinationData of savedEventDestinations) {
 				try {
-					const destination = messageEventBusDestinationFromDb(this.eventBus, destinationData);
+					const destination = messageEventBusDestinationFromDb(
+						this.eventBus,
+						destinationData,
+						this.outboundHttp,
+					);
 					if (destination) {
 						this.destinations[destination.getId()] = destination;
 						this.logger.debug(`Loaded destination ${destination.getId()} from database`);
@@ -91,7 +96,7 @@ export class LogStreamingDestinationService {
 	 */
 	async addDestination(
 		destination: MessageEventBusDestination,
-		notifyWorkers: boolean = true,
+		notifyInstances: boolean = true,
 	): Promise<MessageEventBusDestination> {
 		// Remove any existing destination with the same ID
 		await this.destinations[destination.getId()]?.close();
@@ -103,8 +108,8 @@ export class LogStreamingDestinationService {
 		// Save to database
 		await this.saveDestinationToDb(destination);
 
-		// Notify workers to reload destinations
-		if (notifyWorkers) {
+		// Notify other instances to reload destinations
+		if (notifyInstances) {
 			void this.publisher.publishCommand({ command: 'restart-event-bus' });
 		}
 
@@ -114,7 +119,7 @@ export class LogStreamingDestinationService {
 	/**
 	 * Remove a destination from the local map and delete from database
 	 */
-	async removeDestination(id: string, notifyWorkers: boolean = true): Promise<DeleteResult> {
+	async removeDestination(id: string, notifyInstances: boolean = true): Promise<DeleteResult> {
 		// Close and remove from local map
 		if (this.destinations[id]) {
 			await this.destinations[id].close();
@@ -122,8 +127,8 @@ export class LogStreamingDestinationService {
 			this.logger.debug(`Removed destination ${id}`);
 		}
 
-		// Notify workers to reload destinations
-		if (notifyWorkers) {
+		// Notify other instances to reload destinations
+		if (notifyInstances) {
 			void this.publisher.publishCommand({ command: 'restart-event-bus' });
 		}
 
@@ -159,7 +164,7 @@ export class LogStreamingDestinationService {
 	) {
 		// If there are no destinations that should receive this message, mark it as sent immediately
 		if (!this.shouldSendMsg(msg)) {
-			this.eventBus.confirmSent(msg, { id: '0', name: 'eventBus' });
+			confirmCallback(msg, { id: '0', name: 'eventBus' });
 			return;
 		}
 
@@ -201,7 +206,8 @@ export class LogStreamingDestinationService {
 		if (destination.length > 0) {
 			const sendResult = await this.destinations[destinationId].receiveFromEventBus({
 				msg,
-				confirmCallback: () => this.eventBus.confirmSent(msg, { id: '0', name: 'eventBus' }),
+				confirmCallback: () =>
+					this.eventBus.confirmMessageDelivered(msg, { id: '0', name: 'eventBus' }),
 			});
 			return sendResult;
 		}
@@ -222,9 +228,7 @@ export class LogStreamingDestinationService {
 	 */
 	shouldSendMsg(msg: EventMessageTypes): boolean {
 		return (
-			this.licenseState.isLogStreamingLicensed() &&
-			Object.keys(this.destinations).length > 0 &&
-			this.hasAnyDestinationSubscribedToEvent(msg)
+			Object.keys(this.destinations).length > 0 && this.hasAnyDestinationSubscribedToEvent(msg)
 		);
 	}
 

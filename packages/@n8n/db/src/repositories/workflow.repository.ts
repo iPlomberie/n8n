@@ -1,6 +1,8 @@
 import { GlobalConfig } from '@n8n/config';
+import { assertClearedFor, workflowContentSubject, workflowSubject } from '@n8n/decorators';
 import { Service } from '@n8n/di';
-import { DataSource, Repository, In, Like, Not, IsNull } from '@n8n/typeorm';
+import type { Scope } from '@n8n/permissions';
+import { DataSource, In, Like, Not, IsNull } from '@n8n/typeorm';
 import type {
 	SelectQueryBuilder,
 	UpdateResult,
@@ -10,9 +12,12 @@ import type {
 	FindOptionsRelations,
 	EntityManager,
 } from '@n8n/typeorm';
-import { PROJECT_ROOT, UserError } from 'n8n-workflow';
+import type { QueryDeepPartialEntity } from '@n8n/typeorm/query-builder/QueryPartialEntity';
+import { PROJECT_ROOT, UnexpectedError, UserError } from 'n8n-workflow';
 
+import { BaseRepository } from './base-repository';
 import { FolderRepository } from './folder.repository';
+import { SharedWorkflowRepository } from './shared-workflow.repository';
 import { WorkflowHistoryRepository } from './workflow-history.repository';
 import {
 	WebhookEntity,
@@ -20,17 +25,30 @@ import {
 	WorkflowEntity,
 	WorkflowTagMapping,
 	WorkflowDependency,
+	User,
 } from '../entities';
+import { SharedWorkflow } from '../entities/shared-workflow';
 import type {
 	ListQueryDb,
 	FolderWithWorkflowAndSubFolderCount,
 	ListQuery,
 } from '../entities/types-db';
-import { buildWorkflowsByNodesQuery } from '../utils/build-workflows-by-nodes-query';
+import { type OperationContext, TransactionRunner } from '../services/transaction';
+import { applyWorkflowBooleanSettingFilter } from '../utils/apply-workflow-boolean-setting-filter';
+import { chunkIds } from '../utils/chunk-ids';
+import { escapeLike, LIKE_ESCAPE_CLAUSE } from '../utils/escape-like';
 import { isStringArray } from '../utils/is-string-array';
+import { parseListQuerySortBy } from '../utils/list-query-sort';
 import { TimedQuery } from '../utils/timed-query';
 
 type ResourceType = 'folder' | 'workflow';
+
+/**
+ * An import payload the clearance can bind to: `nodes` is what the subject hashes, and `id` is
+ * concrete rather than the function form a `QueryDeepPartialEntity` would otherwise allow.
+ */
+type UpsertableWorkflowContent = QueryDeepPartialEntity<WorkflowEntity> &
+	Pick<WorkflowEntity, 'nodes'> & { id?: string };
 
 type WorkflowFolderUnionRow = {
 	id: string;
@@ -49,15 +67,92 @@ export type WorkflowFolderUnionFull = (
 	resource: ResourceType;
 };
 
+type WorkflowListResult = {
+	workflows: ListQueryDb.Workflow.Plain[] | ListQueryDb.Workflow.WithSharing[];
+	count: number;
+};
+
+/**
+ * The workflows an agent's workflow tools refer to: refs by id, legacy refs by
+ * name, both inside the agent's project. Shared by the runtime lookup and the
+ * agent dependency index, so the two cannot resolve a reference differently.
+ */
+export function agentToolReferenceWhere(
+	projectId: string,
+	workflowIds: string[],
+	legacyWorkflowNames: string[],
+): Array<FindOptionsWhere<WorkflowEntity>> {
+	const where: Array<FindOptionsWhere<WorkflowEntity>> = [];
+	if (workflowIds.length > 0) {
+		where.push({ id: In(workflowIds), shared: { projectId } });
+	}
+	if (legacyWorkflowNames.length > 0) {
+		where.push({ name: In(legacyWorkflowNames), shared: { projectId } });
+	}
+	return where;
+}
+
 @Service()
-export class WorkflowRepository extends Repository<WorkflowEntity> {
+export class WorkflowRepository extends BaseRepository<WorkflowEntity> {
 	constructor(
 		dataSource: DataSource,
 		private readonly globalConfig: GlobalConfig,
 		private readonly folderRepository: FolderRepository,
+		private readonly sharedWorkflowRepository: SharedWorkflowRepository,
 		private readonly workflowHistoryRepository: WorkflowHistoryRepository,
+		transactionRunner: TransactionRunner,
 	) {
-		super(WorkflowEntity, dataSource.manager);
+		super(WorkflowEntity, dataSource.manager, transactionRunner);
+	}
+
+	/**
+	 * The most recently worked-on non-archived workflows in these projects, newest first, with the
+	 * total in scope.
+	 *
+	 * For telling an agent what already exists here. An event log cannot answer that: a workflow
+	 * nobody has run or edited lately produces no events at all, so it is invisible to a feed while
+	 * being exactly the work somebody might want picked up.
+	 */
+	async findRecentForProjects(
+		projectIds: string[],
+		limit: number,
+	): Promise<{ total: number; workflows: Array<{ id: string; name: string; active: boolean }> }> {
+		if (projectIds.length === 0) return { total: 0, workflows: [] };
+		if (!Number.isInteger(limit) || limit <= 0) return { total: 0, workflows: [] };
+
+		// A workflow can be shared into several projects, so the join multiplies rows when more than
+		// one of them is in scope. Both the count and the page are made distinct on the workflow.
+		const base = () =>
+			this.createQueryBuilder('workflow')
+				.innerJoin(SharedWorkflow, 'shared', 'shared.workflowId = workflow.id')
+				.where('shared.projectId IN (:...projectIds)', { projectIds })
+				.andWhere('workflow.isArchived = :archived', { archived: false });
+
+		const totalRow = await base()
+			.select('COUNT(DISTINCT workflow.id)', 'total')
+			.getRawOne<{ total: number | string }>();
+
+		const rows = await base()
+			.select('workflow.id', 'id')
+			.addSelect('MAX(workflow.name)', 'name')
+			// Published state is `activeVersionId`, not the deprecated `active` column, so this
+			// agrees with every other reader here. Aggregated as an integer because Postgres has no
+			// `max(boolean)`, which would fail there while passing on sqlite.
+			.addSelect('MAX(CASE WHEN workflow.activeVersionId IS NOT NULL THEN 1 ELSE 0 END)', 'active')
+			.groupBy('workflow.id')
+			.orderBy('MAX(workflow.updatedAt)', 'DESC')
+			.limit(limit)
+			.getRawMany<{ id: string; name: string; active: number | string | boolean }>();
+
+		return {
+			// Postgres returns COUNT as a bigint string.
+			total: Number(totalRow?.total ?? 0),
+			workflows: rows.map((row) => ({
+				id: row.id,
+				name: row.name,
+				active: Boolean(Number(row.active)),
+			})),
+		};
 	}
 
 	async get(
@@ -70,11 +165,27 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		});
 	}
 
+	/**
+	 * Archived state of a workflow, or `null` if it no longer exists.
+	 *
+	 * Pass `ctx` when calling from inside a transaction — the read then runs on that
+	 * transaction's connection instead of checking out a second one, which would
+	 * deadlock a single-connection pool.
+	 */
+	async findArchivedState(
+		workflowId: string,
+		ctx: OperationContext = {},
+	): Promise<{ isArchived: boolean } | null> {
+		return await this.managerFor(ctx).findOne(WorkflowEntity, {
+			select: { isArchived: true },
+			where: { id: workflowId },
+		});
+	}
+
 	async getAllActiveIds() {
 		const result = await this.find({
 			select: { id: true },
-			where: { activeVersionId: Not(IsNull()) },
-			relations: { shared: { project: { projectRelations: true } } },
+			where: { activeVersionId: Not(IsNull()), isArchived: false },
 		});
 
 		return result.map(({ id }) => id);
@@ -96,14 +207,39 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		});
 	}
 
+	async getWorkflowInfo({
+		activeOnly,
+	}: { activeOnly: boolean }): Promise<Array<{ id: string; name: string }>> {
+		return await this.find({
+			select: ['id', 'name'],
+			...(activeOnly ? { where: { activeVersionId: Not(IsNull()) } } : {}),
+		});
+	}
+
+	async getPublishedCount() {
+		return await this.count({
+			where: { activeVersionId: Not(IsNull()), isArchived: false },
+		});
+	}
+
+	async getPublishedPersonalWorkflowsCount(): Promise<number> {
+		return await this.createQueryBuilder('workflow')
+			.innerJoin('workflow.shared', 'shared')
+			.innerJoin('shared.project', 'project')
+			.where('workflow.activeVersionId IS NOT NULL')
+			.andWhere('project.type = :type', { type: 'personal' })
+			.andWhere('shared.role = :role', { role: 'workflow:owner' })
+			.getCount();
+	}
+
 	async hasAnyWorkflowsWithErrorWorkflow(): Promise<boolean> {
 		const qb = this.createQueryBuilder('workflow');
 
 		const dbType = this.globalConfig.database.type;
 
-		if (['postgresdb'].includes(dbType)) {
+		if (dbType === 'postgresdb') {
 			qb.where("workflow.settings ->> 'errorWorkflow' IS NOT NULL");
-		} else if (['mysqldb', 'mariadb', 'sqlite'].includes(dbType)) {
+		} else if (dbType === 'sqlite') {
 			qb.where("JSON_EXTRACT(workflow.settings, '$.errorWorkflow') IS NOT NULL");
 		}
 
@@ -111,21 +247,202 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		return count > 0;
 	}
 
+	async updateContent(
+		id: string,
+		content: QueryDeepPartialEntity<WorkflowEntity>,
+		ctx: OperationContext,
+	) {
+		assertClearedFor(ctx.policyCleared, 'workflowSave', { type: 'workflow', id });
+		await this.managerFor(ctx).update(WorkflowEntity, id, content);
+	}
+
+	/**
+	 * Persists a new workflow, gated on a clearance for its content.
+	 *
+	 * A create binds to the node hash, not the id — an id here is either generated on insert or
+	 * client-supplied, and neither is proof of what was checked. So nothing may mutate `nodes`
+	 * between the `enforceWorkflowSave` call and this write.
+	 *
+	 * `save`, not `insert`: only `save` writes the `workflows_tags` junction rows for a
+	 * populated `tags` relation, and returns the entity with its generated id.
+	 */
+	async createContent(workflow: WorkflowEntity, ctx: OperationContext): Promise<WorkflowEntity> {
+		assertClearedFor(ctx.policyCleared, 'workflowSave', workflowContentSubject(workflow));
+		return await this.managerFor(ctx).save(workflow);
+	}
+
+	/**
+	 * Persists an imported workflow by id, gated on a clearance for its content.
+	 *
+	 * Bound to `contentImport`, not `workflowSave` — an import is not an edit, and a clearance
+	 * minted for one point must not unlock the other.
+	 *
+	 * @returns the id of the row written, which the caller needs when the import supplied none.
+	 */
+	async upsertImportedContent(
+		content: UpsertableWorkflowContent,
+		ctx: OperationContext,
+	): Promise<string> {
+		assertClearedFor(
+			ctx.policyCleared,
+			'contentImport',
+			workflowSubject({ id: content.id ?? null, nodes: content.nodes }),
+		);
+
+		const result = await this.managerFor(ctx).upsert(WorkflowEntity, content, ['id']);
+		const id = result.identifiers.at(0)?.id;
+
+		if (typeof id !== 'string') {
+			throw new UnexpectedError('Upsert of an imported workflow returned no id');
+		}
+
+		return id;
+	}
+
+	async findByCredentialResolverId(
+		resolverId: string,
+	): Promise<Array<Pick<WorkflowEntity, 'id' | 'name'>>> {
+		const qb = this.createQueryBuilder('workflow').select(['workflow.id', 'workflow.name']);
+		this.addCredentialResolverFilter(qb, resolverId);
+		return await qb.getMany();
+	}
+
+	/**
+	 * Finds IDs of active workflows that reference a credential resolver.
+	 */
+	async findActiveByCredentialResolverId(resolverId: string): Promise<string[]> {
+		const qb = this.createQueryBuilder('workflow')
+			.select(['workflow.id'])
+			.where('workflow.activeVersionId IS NOT NULL');
+		this.addCredentialResolverFilter(qb, resolverId, 'andWhere');
+		const workflows = await qb.getMany();
+		return workflows.map((w) => w.id);
+	}
+
+	private addCredentialResolverFilter(
+		qb: SelectQueryBuilder<WorkflowEntity>,
+		resolverId: string,
+		method: 'where' | 'andWhere' = 'where',
+	): void {
+		const dbType = this.globalConfig.database.type;
+
+		if (dbType === 'postgresdb') {
+			qb[method]("workflow.settings ->> 'credentialResolverId' = :resolverId", { resolverId });
+		} else if (dbType === 'sqlite') {
+			qb[method]("JSON_EXTRACT(workflow.settings, '$.credentialResolverId') = :resolverId", {
+				resolverId,
+			});
+		}
+	}
+
+	async clearCredentialResolverId(resolverId: string, trx?: EntityManager): Promise<void> {
+		const dbType = this.globalConfig.database.type;
+		const qb = trx
+			? trx.createQueryBuilder().update(WorkflowEntity)
+			: this.createQueryBuilder('workflow').update();
+
+		if (dbType === 'postgresdb') {
+			await qb
+				.set({
+					settings: () => "settings::jsonb - 'credentialResolverId'",
+				})
+				.where("settings ->> 'credentialResolverId' = :resolverId", { resolverId })
+				.execute();
+		} else if (dbType === 'sqlite') {
+			await qb
+				.set({
+					settings: () => "json_remove(settings, '$.credentialResolverId')",
+				})
+				.where("JSON_EXTRACT(settings, '$.credentialResolverId') = :resolverId", {
+					resolverId,
+				})
+				.execute();
+		}
+	}
+
 	async findById(workflowId: string) {
 		return await this.findOne({
 			where: { id: workflowId },
-			relations: { shared: { project: { projectRelations: true } }, activeVersion: true },
+			relations: { shared: { project: true }, activeVersion: true },
 		});
 	}
 
 	async findByIds(workflowIds: string[], { fields }: { fields?: string[] } = {}) {
-		const options: FindManyOptions<WorkflowEntity> = {
-			where: { id: In(workflowIds) },
-		};
+		if (workflowIds.length === 0) {
+			return [];
+		}
 
-		if (fields?.length) options.select = fields as FindOptionsSelect<WorkflowEntity>;
+		const workflows = new Map<string, WorkflowEntity>();
+		for (const chunk of chunkIds(workflowIds)) {
+			const options: FindManyOptions<WorkflowEntity> = {
+				where: { id: In(chunk) },
+			};
 
-		return await this.find(options);
+			if (fields?.length) {
+				options.select = [...new Set(['id', ...fields])] as FindOptionsSelect<WorkflowEntity>;
+			}
+
+			for (const workflow of await this.find(options)) workflows.set(workflow.id, workflow);
+		}
+
+		return [...workflows.values()];
+	}
+
+	async findManyByAgentToolReferences(
+		projectId: string,
+		workflowIds: string[],
+		legacyWorkflowNames: string[],
+	) {
+		const where = agentToolReferenceWhere(projectId, workflowIds, legacyWorkflowNames);
+		if (where.length === 0) return [];
+
+		return await this.find({
+			where,
+			// `connections` is needed so `getWorkflowToolIncompatibilityReason` can
+			// scope its check to nodes reachable from a supported trigger; without
+			// it the backend falls back to scanning every enabled node and
+			// disagrees with the frontend picker, which fetches connections.
+			// `activeVersionId` tells the publish check whether the workflow is published.
+			select: ['id', 'name', 'nodes', 'connections', 'activeVersionId'],
+		});
+	}
+
+	async findOneByAgentToolReference(
+		projectId: string,
+		reference: { workflowId?: string; workflowName: string },
+		options: { withActiveVersion?: boolean } = {},
+	) {
+		const workflowWhere: FindOptionsWhere<WorkflowEntity> =
+			reference.workflowId !== undefined
+				? { id: reference.workflowId }
+				: { name: reference.workflowName };
+
+		return await this.findOne({
+			where: { ...workflowWhere, shared: { projectId } },
+			relations: options.withActiveVersion ? ['shared', 'activeVersion'] : ['shared'],
+		});
+	}
+
+	async findPreExistingWorkflows(workflowIds: string[]): Promise<WorkflowEntity[]> {
+		if (workflowIds.length === 0) {
+			return [];
+		}
+
+		const found = new Map<string, WorkflowEntity>();
+
+		for (const chunk of chunkIds(workflowIds)) {
+			const workflows = await this.createQueryBuilder('workflow')
+				.select(['workflow.id', 'workflow.name', 'workflow.isArchived'])
+				.leftJoin('workflow.shared', 'shared', 'shared.role = :role', {
+					role: 'workflow:owner',
+				})
+				.addSelect(['shared.workflowId', 'shared.projectId', 'shared.role'])
+				.where('workflow.id IN (:...workflowIds)', { workflowIds: chunk })
+				.getMany();
+			for (const workflow of workflows) found.set(workflow.id, workflow);
+		}
+
+		return [...found.values()];
 	}
 
 	async getActiveTriggerCount() {
@@ -137,17 +454,11 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 
 	async updateWorkflowTriggerCount(id: string, triggerCount: number): Promise<UpdateResult> {
 		const qb = this.createQueryBuilder('workflow');
-		const dbType = this.globalConfig.database.type;
 		return await qb
 			.update()
 			.set({
 				triggerCount,
-				updatedAt: () => {
-					if (['mysqldb', 'mariadb'].includes(dbType)) {
-						return 'updatedAt';
-					}
-					return '"updatedAt"';
-				},
+				updatedAt: () => '"updatedAt"',
 			})
 			.where('id = :id', { id })
 			.execute();
@@ -163,7 +474,11 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		return totalWorkflowCount ?? 0;
 	}
 
-	private buildBaseUnionQuery(workflowIds: string[], options: ListQuery.Options = {}) {
+	private buildBaseUnionQuery(
+		workflowIds: string[],
+		options: ListQuery.Options = {},
+		accessibleProjectIds?: string[],
+	) {
 		// Common fields for both folders and workflows
 		const commonFields = {
 			updatedAt: true,
@@ -204,7 +519,7 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		// For union, we need to have the same columns, so add NULL as description for folders
 		const columnNames = [...Object.keys(workflowQueryParameters.select ?? {}), 'resource'];
 
-		const [sortByColumn, sortByDirection] = this.parseSortingParams(
+		const { column: sortByColumn, direction: sortByDirection } = parseListQuerySortBy(
 			options.sortBy ?? 'updatedAt:asc',
 		);
 
@@ -212,6 +527,20 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 			.getManyQuery(folderQueryParameters)
 			.addSelect('NULL', 'description') // Add NULL for description in folders
 			.addSelect("'folder'", 'resource');
+
+		// Restrict folders to only those in projects the user has access to.
+		// Without this, folders from other users' projects leak into the count/list
+		// and prevent the empty-state screen from showing for users with no accessible content.
+		// When undefined (admin users), no filtering is applied — they can see all folders.
+		if (accessibleProjectIds !== undefined) {
+			if (accessibleProjectIds.length > 0) {
+				foldersQuery.andWhere('folder.projectId IN (:...accessibleProjectIds)', {
+					accessibleProjectIds,
+				});
+			} else {
+				foldersQuery.andWhere('1 = 0');
+			}
+		}
 
 		const workflowsQuery = this.getManyQuery(workflowIds, workflowQueryParameters).addSelect(
 			"'workflow'",
@@ -234,10 +563,15 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		};
 	}
 
-	async getWorkflowsAndFoldersUnion(workflowIds: string[], options: ListQuery.Options = {}) {
+	async getWorkflowsAndFoldersUnion(
+		workflowIds: string[],
+		options: ListQuery.Options = {},
+		accessibleProjectIds?: string[],
+	) {
 		const { baseQuery, sortByColumn, sortByDirection } = this.buildBaseUnionQuery(
 			workflowIds,
 			options,
+			accessibleProjectIds,
 		);
 
 		const query = this.buildUnionQuery(baseQuery, {
@@ -316,10 +650,18 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		return results.map(({ name_lower, ...rest }) => rest);
 	}
 
-	async getWorkflowsAndFoldersCount(workflowIds: string[], options: ListQuery.Options = {}) {
+	async getWorkflowsAndFoldersCount(
+		workflowIds: string[],
+		options: ListQuery.Options = {},
+		accessibleProjectIds?: string[],
+	) {
 		const { skip, take, ...baseQueryParameters } = options;
 
-		const { baseQuery } = this.buildBaseUnionQuery(workflowIds, baseQueryParameters);
+		const { baseQuery } = this.buildBaseUnionQuery(
+			workflowIds,
+			baseQueryParameters,
+			accessibleProjectIds,
+		);
 
 		const response = await baseQuery
 			.select(`COUNT(DISTINCT ${baseQuery.escape('RESULT')}.${baseQuery.escape('id')})`, 'count')
@@ -330,7 +672,11 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		return Number(response?.count) || 0;
 	}
 
-	async getWorkflowsAndFoldersWithCount(workflowIds: string[], options: ListQuery.Options = {}) {
+	async getWorkflowsAndFoldersWithCount(
+		workflowIds: string[],
+		options: ListQuery.Options = {},
+		accessibleProjectIds?: string[],
+	) {
 		if (
 			options.filter?.parentFolderId &&
 			typeof options.filter?.parentFolderId === 'string' &&
@@ -349,8 +695,8 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		}
 
 		const [workflowsAndFolders, count] = await Promise.all([
-			this.getWorkflowsAndFoldersUnion(workflowIds, options),
-			this.getWorkflowsAndFoldersCount(workflowIds, options),
+			this.getWorkflowsAndFoldersUnion(workflowIds, options, accessibleProjectIds),
+			this.getWorkflowsAndFoldersCount(workflowIds, options, accessibleProjectIds),
 		]);
 
 		const isArchived =
@@ -364,6 +710,211 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		});
 
 		return [enrichedWorkflowsAndFolders, count] as const;
+	}
+
+	/**
+	 * Get workflows and folders with sharing permissions using a subquery.
+	 * This combines the workflow and sharing queries into a single database query.
+	 */
+	async getWorkflowsAndFoldersWithCountWithSharingSubquery(
+		user: User,
+		sharingOptions: {
+			scopes?: Scope[];
+			projectRoles?: string[];
+			workflowRoles?: string[];
+			isPersonalProject?: boolean;
+			personalProjectOwnerId?: string;
+			onlySharedWithMe?: boolean;
+		},
+		options: ListQuery.Options = {},
+		callableForParentWorkflowId?: string,
+	) {
+		if (
+			options.filter?.parentFolderId &&
+			typeof options.filter?.parentFolderId === 'string' &&
+			options.filter.parentFolderId !== PROJECT_ROOT &&
+			typeof options.filter?.projectId === 'string' &&
+			options.filter.query
+		) {
+			const folderIds = await this.folderRepository.getAllFolderIdsInHierarchy(
+				options.filter.parentFolderId,
+				options.filter.projectId,
+			);
+
+			options.filter.parentFolderIds = [options.filter.parentFolderId, ...folderIds];
+			options.filter.folderIds = folderIds;
+			delete options.filter.parentFolderId;
+		}
+
+		const [workflowsAndFolders, count] = await Promise.all([
+			this.getWorkflowsAndFoldersUnionWithSharingSubquery(
+				user,
+				sharingOptions,
+				options,
+				callableForParentWorkflowId,
+			),
+			this.getWorkflowsAndFoldersCountWithSharingSubquery(
+				user,
+				sharingOptions,
+				options,
+				callableForParentWorkflowId,
+			),
+		]);
+
+		const isArchived =
+			typeof options.filter?.isArchived === 'boolean' ? options.filter.isArchived : undefined;
+
+		const { workflows, folders } = await this.fetchExtraData(workflowsAndFolders, isArchived);
+
+		const enrichedWorkflowsAndFolders = this.enrichDataWithExtras(workflowsAndFolders, {
+			workflows,
+			folders,
+		});
+
+		return [enrichedWorkflowsAndFolders, count] as const;
+	}
+
+	private async getWorkflowsAndFoldersUnionWithSharingSubquery(
+		user: User,
+		sharingOptions: {
+			scopes?: Scope[];
+			projectRoles?: string[];
+			workflowRoles?: string[];
+			isPersonalProject?: boolean;
+			personalProjectOwnerId?: string;
+			onlySharedWithMe?: boolean;
+		},
+		options: ListQuery.Options = {},
+		callableForParentWorkflowId?: string,
+	) {
+		const { baseQuery, sortByColumn, sortByDirection } =
+			this.buildBaseUnionQueryWithSharingSubquery(
+				user,
+				sharingOptions,
+				options,
+				callableForParentWorkflowId,
+			);
+
+		const query = this.buildUnionQuery(baseQuery, {
+			sortByColumn,
+			sortByDirection,
+			pagination: {
+				take: options.take,
+				skip: options.skip ?? 0,
+			},
+		});
+
+		const workflowsAndFolders = await query.getRawMany<WorkflowFolderUnionRow>();
+		return this.removeNameLowerFromResults(workflowsAndFolders);
+	}
+
+	private async getWorkflowsAndFoldersCountWithSharingSubquery(
+		user: User,
+		sharingOptions: {
+			scopes?: Scope[];
+			projectRoles?: string[];
+			workflowRoles?: string[];
+			isPersonalProject?: boolean;
+			personalProjectOwnerId?: string;
+			onlySharedWithMe?: boolean;
+		},
+		options: ListQuery.Options = {},
+		callableForParentWorkflowId?: string,
+	) {
+		const { skip, take, ...baseQueryParameters } = options;
+
+		const { baseQuery } = this.buildBaseUnionQueryWithSharingSubquery(
+			user,
+			sharingOptions,
+			baseQueryParameters,
+			callableForParentWorkflowId,
+		);
+
+		const response = await baseQuery
+			.select('COUNT(*)', 'count')
+			.from('RESULT_QUERY', 'RESULT')
+			.getRawOne<{ count: number | string }>();
+
+		return Number(response?.count) || 0;
+	}
+
+	private buildBaseUnionQueryWithSharingSubquery(
+		user: User,
+		sharingOptions: {
+			scopes?: Scope[];
+			projectRoles?: string[];
+			workflowRoles?: string[];
+			isPersonalProject?: boolean;
+			personalProjectOwnerId?: string;
+			onlySharedWithMe?: boolean;
+		},
+		options: ListQuery.Options = {},
+		callableForParentWorkflowId?: string,
+	) {
+		// Common fields for both folders and workflows
+		const commonFields = {
+			updatedAt: true,
+			createdAt: true,
+			id: true,
+			name: true,
+		} as const;
+
+		// Transform `query` => `name` for folder repository
+		const folderFilter = options.filter ? { ...options.filter } : undefined;
+		if (folderFilter?.query) {
+			folderFilter.name = folderFilter.query;
+		}
+
+		const folderQueryParameters: ListQuery.Options = {
+			select: commonFields,
+			filter: folderFilter,
+		};
+
+		const workflowQueryParameters: ListQuery.Options = {
+			select: {
+				...commonFields,
+				description: true,
+				updatedAt: true,
+				createdAt: true,
+				id: true,
+				name: true,
+			},
+			filter: options.filter,
+		};
+
+		// For union, we need to have the same columns, so add NULL as description for folders
+		const columnNames = [...Object.keys(workflowQueryParameters.select ?? {}), 'resource'];
+
+		const { column: sortByColumn, direction: sortByDirection } = parseListQuerySortBy(
+			options.sortBy ?? 'updatedAt:asc',
+		);
+
+		const foldersQuery = this.folderRepository
+			.getManyQuery(folderQueryParameters)
+			.addSelect('NULL', 'description') // Add NULL for description in folders
+			.addSelect("'folder'", 'resource');
+
+		const workflowsQuery = this.getManyQueryWithSharingSubquery(
+			user,
+			sharingOptions,
+			workflowQueryParameters,
+			callableForParentWorkflowId,
+		).addSelect("'workflow'", 'resource');
+
+		const qb = this.manager.createQueryBuilder();
+
+		return {
+			baseQuery: qb
+				.createQueryBuilder()
+				.addCommonTableExpression(foldersQuery, 'FOLDERS_QUERY', { columnNames })
+				.addCommonTableExpression(workflowsQuery, 'WORKFLOWS_QUERY', { columnNames })
+				.addCommonTableExpression(
+					`SELECT * FROM ${qb.escape('FOLDERS_QUERY')} UNION ALL SELECT * FROM ${qb.escape('WORKFLOWS_QUERY')}`,
+					'RESULT_QUERY',
+				),
+			sortByColumn,
+			sortByDirection,
+		};
 	}
 
 	async getAllWorkflowIdsInHierarchy(folderId: string, projectId: string): Promise<string[]> {
@@ -426,33 +977,218 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 	}
 
 	@TimedQuery()
-	async getMany(workflowIds: string[], options: ListQuery.Options = {}) {
+	async getMany(
+		workflowIds: string[],
+		options: ListQuery.Options = {},
+	): Promise<WorkflowListResult['workflows']> {
 		if (workflowIds.length === 0) {
 			return [];
 		}
 
 		const query = this.getManyQuery(workflowIds, options);
-
-		const workflows = (await query.getMany()) as
-			| ListQueryDb.Workflow.Plain[]
-			| ListQueryDb.Workflow.WithSharing[];
-
-		return workflows;
+		return await query.getMany();
 	}
 
-	async getManyAndCount(sharedWorkflowIds: string[], options: ListQuery.Options = {}) {
+	async getManyAndCount(
+		sharedWorkflowIds: string[],
+		options: ListQuery.Options = {},
+	): Promise<WorkflowListResult> {
 		if (sharedWorkflowIds.length === 0) {
 			return { workflows: [], count: 0 };
 		}
 
 		const query = this.getManyQuery(sharedWorkflowIds, options);
-
-		const [workflows, count] = (await query.getManyAndCount()) as [
-			ListQueryDb.Workflow.Plain[] | ListQueryDb.Workflow.WithSharing[],
-			number,
-		];
-
+		const [workflows, count] = await query.getManyAndCount();
 		return { workflows, count };
+	}
+
+	/**
+	 * Get workflows with sharing permissions using a subquery instead of pre-fetched IDs.
+	 * This combines the workflow and sharing queries into a single database query.
+	 */
+	async getManyAndCountWithSharingSubquery(
+		user: User,
+		sharingOptions: {
+			scopes?: Scope[];
+			projectRoles?: string[];
+			workflowRoles?: string[];
+			isPersonalProject?: boolean;
+			personalProjectOwnerId?: string;
+			onlySharedWithMe?: boolean;
+		},
+		options: ListQuery.Options = {},
+		callableForParentWorkflowId?: string,
+	): Promise<WorkflowListResult> {
+		const query = this.getManyQueryWithSharingSubquery(
+			user,
+			sharingOptions,
+			options,
+			callableForParentWorkflowId,
+		);
+
+		const [workflows, count] = await query.getManyAndCount();
+		return { workflows, count };
+	}
+
+	/**
+	 * Build a query that filters workflows based on sharing permissions using a subquery.
+	 */
+	private getManyQueryWithSharingSubquery(
+		user: User,
+		sharingOptions: {
+			scopes?: Scope[];
+			projectRoles?: string[];
+			workflowRoles?: string[];
+			isPersonalProject?: boolean;
+			personalProjectOwnerId?: string;
+			onlySharedWithMe?: boolean;
+		},
+		options: ListQuery.Options = {},
+		callableForParentWorkflowId?: string,
+	): SelectQueryBuilder<WorkflowEntity> {
+		const qb = this.createQueryBuilder('workflow');
+
+		// Pass projectId from options to sharing options
+		const projectId =
+			typeof options.filter?.projectId === 'string' ? options.filter.projectId : undefined;
+		const sharingOptionsWithProjectId = {
+			...sharingOptions,
+			projectId,
+		};
+
+		// Build the subquery for shared workflow IDs
+		const sharedWorkflowSubquery = this.buildSharedWorkflowIdsSubquery(
+			user,
+			sharingOptionsWithProjectId,
+		);
+
+		if (callableForParentWorkflowId) {
+			// Union: workflows readable by the user OR callable by the parent workflow.
+			const callableSubquery = this.buildCallablePolicySubquery(callableForParentWorkflowId);
+			qb.andWhere(
+				`(workflow.id IN (${sharedWorkflowSubquery.getQuery()}) OR workflow.id IN (${callableSubquery.getQuery()}))`,
+			);
+			qb.setParameters({
+				...sharedWorkflowSubquery.getParameters(),
+				...callableSubquery.getParameters(),
+			});
+		} else {
+			// Apply the sharing filter using the subquery
+			qb.andWhere(`workflow.id IN (${sharedWorkflowSubquery.getQuery()})`);
+			qb.setParameters(sharedWorkflowSubquery.getParameters());
+		}
+
+		// Apply other filters
+		// For personal project and shared-with-me cases, projectId is already handled in the subquery
+		// so we need to skip it to avoid double-filtering
+		const shouldSkipProjectIdFilter =
+			sharingOptions.isPersonalProject || sharingOptions.onlySharedWithMe;
+		const filtersToApply =
+			shouldSkipProjectIdFilter && options.filter
+				? { ...options.filter, projectId: undefined }
+				: options.filter;
+
+		this.applyFilters(qb, filtersToApply);
+		this.applyTriggerNodeTypesFilter(qb, options.filter?.triggerNodeTypes as string[] | undefined);
+		this.applySelect(qb, options.select);
+		this.applyRelations(qb, options.select);
+		this.applySorting(qb, options.sortBy);
+		this.applyPagination(qb, options);
+
+		return qb;
+	}
+
+	/**
+	 * Build a subquery returning IDs of workflows whose callerPolicy permits the
+	 * given `parentWorkflowId` to call them.
+	 */
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	private buildCallablePolicySubquery(parentWorkflowId: string): SelectQueryBuilder<any> {
+		const subquery = this.manager
+			.createQueryBuilder()
+			.select('cpw.id')
+			.from(WorkflowEntity, 'cpw')
+			.leftJoin(
+				SharedWorkflow,
+				'sw_sub',
+				"sw_sub.workflowId = cpw.id AND sw_sub.role = 'workflow:owner'",
+			)
+			.leftJoin(
+				SharedWorkflow,
+				'sw_par',
+				"sw_par.workflowId = :cpParentWorkflowId AND sw_par.role = 'workflow:owner'",
+			);
+
+		const { conditions, params } = this.buildCallablePolicyConditions(parentWorkflowId);
+
+		subquery.where('(' + conditions.join(' OR ') + ')', params);
+
+		return subquery;
+	}
+
+	private buildCallablePolicyConditions(parentWorkflowId: string): {
+		conditions: string[];
+		params: Record<string, string>;
+	} {
+		const defaultPolicy = this.globalConfig.workflows.callerPolicyDefaultOption;
+		const callerPolicy = this.settingsTextValue('cpw.settings', 'callerPolicy');
+		const callerIds = this.settingsTextValue('cpw.settings', 'callerIds');
+
+		const conditions: string[] = [];
+		const params: Record<string, string> = {
+			cpParentWorkflowId: parentWorkflowId,
+			cpCallerIdMembership: `%,${escapeLike(parentWorkflowId)},%`,
+		};
+
+		// Branch 1: callerPolicy = 'any'
+		conditions.push(`${callerPolicy} = 'any'`);
+
+		// Branch 2: callerPolicy = 'workflowsFromAList' and the allowlist contains parentWorkflowId as a whole ID.
+		conditions.push(
+			`(${callerPolicy} = 'workflowsFromAList' AND (',' || REPLACE(${callerIds}, ' ', '') || ',') LIKE :cpCallerIdMembership ${LIKE_ESCAPE_CLAUSE})`,
+		);
+
+		// Branch 3: callerPolicy = 'workflowsFromSameOwner' (or NULL when default is 'workflowsFromSameOwner').
+		const sameOwnerPolicyClauses = [`${callerPolicy} = 'workflowsFromSameOwner'`];
+		if (defaultPolicy === 'workflowsFromSameOwner') {
+			sameOwnerPolicyClauses.push(`${callerPolicy} IS NULL`);
+		}
+		conditions.push(
+			`((${sameOwnerPolicyClauses.join(' OR ')}) AND sw_sub.projectId = sw_par.projectId AND sw_par.projectId IS NOT NULL)`,
+		);
+
+		// Handle NULL callerPolicy when default is 'any'
+		if (defaultPolicy === 'any') {
+			conditions.push(`${callerPolicy} IS NULL`);
+		}
+
+		return { conditions, params };
+	}
+
+	private settingsTextValue(field: string, key: string): string {
+		return this.globalConfig.database.type === 'postgresdb'
+			? `${field} ->> '${key}'`
+			: `JSON_EXTRACT(${field}, '$.${key}')`;
+	}
+
+	/**
+	 * Build a subquery that returns workflow IDs based on sharing permissions.
+	 * Delegates to SharedWorkflowRepository.buildSharedWorkflowIdsSubquery.
+	 */
+	private buildSharedWorkflowIdsSubquery(
+		user: User,
+		sharingOptions: {
+			scopes?: Scope[];
+			projectRoles?: string[];
+			workflowRoles?: string[];
+			isPersonalProject?: boolean;
+			personalProjectOwnerId?: string;
+			onlySharedWithMe?: boolean;
+			projectId?: string;
+		},
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	): SelectQueryBuilder<any> {
+		return this.sharedWorkflowRepository.buildSharedWorkflowIdsSubquery(user, sharingOptions);
 	}
 
 	getManyQuery(workflowIds: string[], options: ListQuery.Options = {}) {
@@ -497,42 +1233,15 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		filter: ListQuery.Options['filter'],
 	): void {
 		if (typeof filter?.availableInMCP === 'boolean') {
-			const dbType = this.globalConfig.database.type;
-
-			if (filter.availableInMCP) {
-				// When filtering for true, only match explicit true values
-				if (['postgresdb'].includes(dbType)) {
-					qb.andWhere("workflow.settings ->> 'availableInMCP' = :availableInMCP", {
-						availableInMCP: 'true',
-					});
-				} else if (['mysqldb', 'mariadb'].includes(dbType)) {
-					qb.andWhere("JSON_EXTRACT(workflow.settings, '$.availableInMCP') = :availableInMCP", {
-						availableInMCP: true,
-					});
-				} else if (dbType === 'sqlite') {
-					qb.andWhere("JSON_EXTRACT(workflow.settings, '$.availableInMCP') = :availableInMCP", {
-						availableInMCP: 1, // SQLite stores booleans as 0/1
-					});
-				}
-			} else {
-				// When filtering for false, match explicit false OR null/undefined (field not set)
-				if (['postgresdb'].includes(dbType)) {
-					qb.andWhere(
-						"(workflow.settings ->> 'availableInMCP' = :availableInMCP OR workflow.settings ->> 'availableInMCP' IS NULL)",
-						{ availableInMCP: 'false' },
-					);
-				} else if (['mysqldb', 'mariadb'].includes(dbType)) {
-					qb.andWhere(
-						"(JSON_EXTRACT(workflow.settings, '$.availableInMCP') = :availableInMCP OR JSON_EXTRACT(workflow.settings, '$.availableInMCP') IS NULL)",
-						{ availableInMCP: false },
-					);
-				} else if (dbType === 'sqlite') {
-					qb.andWhere(
-						"(JSON_EXTRACT(workflow.settings, '$.availableInMCP') = :availableInMCP OR JSON_EXTRACT(workflow.settings, '$.availableInMCP') IS NULL)",
-						{ availableInMCP: 0 }, // SQLite stores booleans as 0/1
-					);
-				}
-			}
+			applyWorkflowBooleanSettingFilter(
+				qb,
+				this.globalConfig,
+				'availableInMCP',
+				filter.availableInMCP,
+				{
+					includeNullOnFalse: true,
+				},
+			);
 		}
 	}
 
@@ -568,7 +1277,7 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 					`COALESCE("activeVersion"."nodes"::text, "workflow"."nodes"::text) LIKE :${paramName}`,
 				);
 			} else {
-				// SQLite and MySQL store nodes as text
+				// SQLite stores nodes as text
 				conditions.push(`COALESCE(activeVersion.nodes, workflow.nodes) LIKE :${paramName}`);
 			}
 		});
@@ -602,7 +1311,7 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 	}
 
 	/**
-	 * Builds search conditions and parameters for matching any of the search words
+	 * Builds search conditions and parameters for matching all of the search words
 	 */
 	private buildSearchConditions(searchWords: string[]): {
 		conditions: string[];
@@ -624,17 +1333,21 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 
 	/**
 	 * Applies a name or description filter to the query builder.
-	 * We are supporting searching by multiple words, where any of the words can match
+	 * We are supporting searching by multiple words, where all of the words must match
 	 */
 	private applyNameFilter(
 		qb: SelectQueryBuilder<WorkflowEntity>,
 		filter: ListQuery.Options['filter'],
 	): void {
+		if (typeof filter?.name === 'string' && filter.name.trim() !== '') {
+			qb.andWhere('workflow.name LIKE :name', { name: `%${filter.name.trim()}%` });
+		}
+
 		const searchWords = this.parseSearchWords(filter?.query);
 
 		if (searchWords.length > 0) {
 			const { conditions, parameters } = this.buildSearchConditions(searchWords);
-			qb.andWhere(`(${conditions.join(' OR ')})`, parameters);
+			qb.andWhere(`(${conditions.join(' AND ')})`, parameters);
 		}
 	}
 
@@ -721,15 +1434,25 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 
 		if (!nodeTypes.length) return;
 
-		const { whereClause, parameters } = buildWorkflowsByNodesQuery(
-			nodeTypes,
-			this.globalConfig.database.type,
-		);
-
-		qb.andWhere(whereClause, parameters);
+		const subQuery = this.buildWorkflowIdsByNodeTypesSubQuery(nodeTypes);
+		qb.andWhere(`workflow.id IN (${subQuery.getQuery()})`);
+		qb.setParameters(subQuery.getParameters());
 	}
 
-	private applyOwnedByRelation(qb: SelectQueryBuilder<WorkflowEntity>): void {
+	private buildWorkflowIdsByNodeTypesSubQuery(nodeTypes: string[]) {
+		return this.manager
+			.createQueryBuilder(WorkflowDependency, 'dep')
+			.select('dep.workflowId')
+			.distinct(true)
+			.where('dep.dependencyType = :depType', { depType: 'nodeType' })
+			.andWhere('dep.dependencyKey IN (:...nodeTypes)', { nodeTypes })
+			.andWhere('dep.publishedVersionId IS NULL');
+	}
+
+	private applyOwnedByRelation(
+		qb: SelectQueryBuilder<WorkflowEntity>,
+		includeProject: boolean,
+	): void {
 		// Check if 'shared' join already exists from project filter
 		if (!qb.expressionMap.aliases.find((alias) => alias.name === 'shared')) {
 			qb.leftJoin('workflow.shared', 'shared');
@@ -742,16 +1465,18 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 			'shared.updatedAt',
 			'shared.workflowId',
 			'shared.projectId',
-		])
-			.leftJoin('shared.project', 'project')
-			.addSelect([
-				'project.id',
-				'project.name',
-				'project.type',
-				'project.icon',
-				'project.createdAt',
-				'project.updatedAt',
-			]);
+		]);
+
+		if (!includeProject) return;
+
+		qb.leftJoin('shared.project', 'project').addSelect([
+			'project.id',
+			'project.name',
+			'project.type',
+			'project.icon',
+			'project.createdAt',
+			'project.updatedAt',
+		]);
 	}
 
 	private applySelect(
@@ -781,7 +1506,7 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 
 		// Handle special fields separately
 		const regularFields = Object.entries(select).filter(
-			([field]) => !['ownedBy', 'tags', 'parentFolder', 'activeVersion'].includes(field),
+			([field]) => !['ownedBy', 'shared', 'tags', 'parentFolder', 'activeVersion'].includes(field),
 		);
 
 		// Add regular fields
@@ -803,6 +1528,7 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		const isDefaultSelect = select === undefined;
 		const areTagsRequested = isDefaultSelect || select?.tags;
 		const isOwnedByIncluded = isDefaultSelect || select?.ownedBy;
+		const isSharedOnlyIncluded = !isOwnedByIncluded && select?.shared;
 		const isParentFolderIncluded = isDefaultSelect || select?.parentFolder;
 		const isActiveVersionIncluded = select?.activeVersion;
 
@@ -819,7 +1545,9 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		}
 
 		if (isOwnedByIncluded) {
-			this.applyOwnedByRelation(qb);
+			this.applyOwnedByRelation(qb, true);
+		} else if (isSharedOnlyIncluded) {
+			this.applyOwnedByRelation(qb, false);
 		}
 
 		if (isActiveVersionIncluded) {
@@ -830,14 +1558,22 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 	private applyActiveVersionRelation(qb: SelectQueryBuilder<WorkflowEntity>): void {
 		qb.leftJoin('workflow.activeVersion', 'activeVersion').addSelect([
 			'activeVersion.versionId',
+			'activeVersion.workflowId',
 			'activeVersion.nodes',
 			'activeVersion.connections',
+			'activeVersion.nodeGroups',
+			'activeVersion.authors',
+			'activeVersion.name',
+			'activeVersion.description',
+			'activeVersion.autosaved',
+			'activeVersion.createdAt',
+			'activeVersion.updatedAt',
 		]);
 	}
 
 	private applyTagsRelation(qb: SelectQueryBuilder<WorkflowEntity>): void {
 		qb.leftJoin('workflow.tags', 'tags')
-			.addSelect(['tags.id', 'tags.name'])
+			.addSelect(['tags.id', 'tags.name', 'tags.createdAt', 'tags.updatedAt'])
 			.addOrderBy('tags.createdAt', 'ASC');
 	}
 
@@ -847,13 +1583,8 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 			return;
 		}
 
-		const [column, direction] = this.parseSortingParams(sortBy);
+		const { column, direction } = parseListQuerySortBy(sortBy);
 		this.applySortingByColumn(qb, column, direction);
-	}
-
-	private parseSortingParams(sortBy: string): [string, 'ASC' | 'DESC'] {
-		const [column, order] = sortBy.split(':');
-		return [column, order.toUpperCase() as 'ASC' | 'DESC'];
 	}
 
 	private applySortingByColumn(
@@ -903,9 +1634,8 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 	}
 
 	async updateActiveState(workflowId: string, newState: boolean) {
-		const workflow = await this.findById(workflowId);
-
-		if (!workflow) {
+		const wfExists = await this.existsBy({ id: workflowId });
+		if (!wfExists) {
 			throw new UserError(`Workflow "${workflowId}" not found.`);
 		}
 
@@ -929,19 +1659,22 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 	 * @param versionId - The ID of the version to publish (optional; if not provided, uses the current version)
 	 * */
 	async publishVersion(workflowId: string, versionId?: string) {
-		let versionIdToPublish = versionId;
-		if (!versionIdToPublish) {
-			const workflow = await this.findOne({
-				where: { id: workflowId },
-				select: ['id', 'versionId'],
-			});
+		const workflow = await this.findOne({
+			where: { id: workflowId },
+			select: ['id', 'versionId', 'isArchived'],
+		});
 
-			if (!workflow) {
-				throw new UserError(`Workflow "${workflowId}" not found.`);
-			}
-
-			versionIdToPublish = workflow.versionId;
+		if (!workflow) {
+			throw new UserError(`Workflow "${workflowId}" not found.`);
 		}
+
+		if (workflow.isArchived) {
+			throw new UserError('Cannot publish archived Workflow', {
+				extra: { workflowId },
+			});
+		}
+
+		const versionIdToPublish = versionId ?? workflow.versionId;
 
 		const version = await this.workflowHistoryRepository.findOneBy({
 			workflowId,
@@ -996,11 +1729,7 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		if (!nodeTypes?.length) return [];
 
 		const qb = this.createQueryBuilder('workflow');
-
-		const { whereClause, parameters } = buildWorkflowsByNodesQuery(
-			nodeTypes,
-			this.globalConfig.database.type,
-		);
+		const subQuery = this.buildWorkflowIdsByNodeTypesSubQuery(nodeTypes);
 
 		const workflows: Array<
 			Pick<WorkflowEntity, 'id' | 'name' | 'active' | 'activeVersionId'> &
@@ -1013,15 +1742,16 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 				'workflow.activeVersionId',
 				...(includeNodes ? ['workflow.nodes'] : []),
 			])
-			.where(whereClause, parameters)
+			.where(`workflow.id IN (${subQuery.getQuery()})`)
+			.setParameters(subQuery.getParameters())
 			.getMany();
 
 		return workflows;
 	}
 
 	/**
-	 * Find workflows that need indexing - either unindexed (no entries in workflow_dependency)
-	 * or outdated (versionCounter > workflowVersionId in workflow_dependency).
+	 * Find workflows that need draft indexing - either unindexed (no draft entries in workflow_dependency)
+	 * or outdated (versionCounter > workflowVersionId in workflow_dependency for drafts).
 	 *
 	 * NOTE: we use a simple batch limit instead of proper pagination because we use this
 	 * method to retrieve workflows and then index them immediately - so they won't be returned
@@ -1034,20 +1764,33 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 		const maxVersionIdAlias = 'maxVersionId';
 		const depAlias = 'dep';
 
+		// Only select columns needed for indexing to avoid loading large unused
+		// JSON columns (connections, staticData, pinData) that can cause OOM.
+		qb.select([
+			'workflow.id',
+			'workflow.versionCounter',
+			'workflow.activeVersionId',
+			'workflow.nodes',
+		]);
+
 		qb.leftJoin(
 			(subQuery) => {
-				return subQuery
-					.select('wd.workflowId', workflowIdAlias)
-					.addSelect('MAX(wd.workflowVersionId)', maxVersionIdAlias)
-					.from(WorkflowDependency, 'wd')
-					.groupBy('wd.workflowId');
+				return (
+					subQuery
+						.select('wd.workflowId', workflowIdAlias)
+						.addSelect('MAX(wd.workflowVersionId)', maxVersionIdAlias)
+						.from(WorkflowDependency, 'wd')
+						// Only consider draft dependencies (publishedVersionId IS NULL)
+						.where('wd.publishedVersionId IS NULL')
+						.groupBy('wd.workflowId')
+				);
 			},
 			depAlias,
 			`workflow.id = ${qb.escape(depAlias)}.${qb.escape(workflowIdAlias)}`,
 		);
 
 		// Include workflows that are either:
-		// 1. Unindexed (no dependency entries exist)
+		// 1. Unindexed (no draft dependency entries exist)
 		// 2. Outdated (workflow version is newer than indexed version)
 		qb.where(`${qb.escape(depAlias)}.${qb.escape(workflowIdAlias)} IS NULL`).orWhere(
 			`workflow.versionCounter > ${qb.escape(depAlias)}.${qb.escape(maxVersionIdAlias)}`,
@@ -1060,9 +1803,62 @@ export class WorkflowRepository extends Repository<WorkflowEntity> {
 	}
 
 	/**
+	 * Find active workflows that need published version indexing.
+	 * These are workflows where:
+	 * - activeVersionId IS NOT NULL (workflow is active/published)
+	 * - No dependency rows exist with matching publishedVersionId = activeVersionId
+	 *
+	 * This includes the activeVersion relation for efficiency.
+	 */
+	async findWorkflowsNeedingPublishedVersionIndexing(
+		batchSize?: number,
+	): Promise<WorkflowEntity[]> {
+		const qb = this.createQueryBuilder('workflow');
+		const depAlias = 'dep';
+		const publishedVersionIdAlias = 'publishedVersionId';
+
+		// Only select columns needed for indexing to avoid loading large unused
+		// JSON columns (connections, staticData, pinData) that can cause OOM.
+		// For published version indexing we need the published version's nodes
+		// (from activeVersion), not the draft nodes.
+		qb.select(['workflow.id', 'workflow.versionCounter', 'workflow.activeVersionId']);
+
+		// Left join to find matching published version dependencies
+		qb.leftJoin(
+			(subQuery) => {
+				return subQuery
+					.select('wd.workflowId', 'workflowId')
+					.addSelect('wd.publishedVersionId', publishedVersionIdAlias)
+					.from(WorkflowDependency, 'wd')
+					.where('wd.publishedVersionId IS NOT NULL')
+					.groupBy('wd.workflowId')
+					.addGroupBy('wd.publishedVersionId');
+			},
+			depAlias,
+			`workflow.id = ${qb.escape(depAlias)}.${qb.escape('workflowId')} AND workflow.activeVersionId = ${qb.escape(depAlias)}.${qb.escape(publishedVersionIdAlias)}`,
+		);
+
+		// Only include active workflows with no matching published version dependency
+		qb.where('workflow.activeVersionId IS NOT NULL').andWhere(
+			`${qb.escape(depAlias)}.${qb.escape(publishedVersionIdAlias)} IS NULL`,
+		);
+
+		// Include the published version's nodes for indexing (skip connections to save memory).
+		// The primary key (versionId) must be selected for TypeORM to hydrate the relation.
+		qb.leftJoin('workflow.activeVersion', 'activeVersion');
+		qb.addSelect(['activeVersion.versionId', 'activeVersion.nodes']);
+
+		if (batchSize) {
+			qb.limit(batchSize);
+		}
+
+		return await qb.getMany();
+	}
+
+	/**
 	 * Returns if the workflow is stored as `active`.
 	 *
-	 * @important Do not confuse with `ActiveWorkflows.isActive()`,
+	 * @important Do not confuse with `ActiveWorkflowTriggers.isActive()`,
 	 * which checks if the workflow is active in memory.
 	 */
 	async isActive(workflowId: string) {

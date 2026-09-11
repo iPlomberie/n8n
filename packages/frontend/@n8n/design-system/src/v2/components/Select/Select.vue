@@ -24,10 +24,6 @@ import {
 } from 'reka-ui';
 import { computed, useCssModule, useTemplateRef } from 'vue';
 
-import Icon from '@n8n/design-system/components/N8nIcon/Icon.vue';
-import { get } from '@n8n/design-system/v2/utils';
-import type { GetItemKeys, GetModelValue } from '@n8n/design-system/v2/utils/types';
-
 import type {
 	SelectEmits,
 	SelectItem,
@@ -39,6 +35,9 @@ import type {
 	SelectItemProps,
 } from './Select.types';
 import N8nSelectItem from './SelectItem.vue';
+import Icon from '../../../components/N8nIcon/Icon.vue';
+import { get } from '../../utils';
+import type { GetItemKeys, GetModelValue } from '../../utils/types';
 
 defineOptions({ inheritAttrs: false });
 
@@ -48,6 +47,9 @@ const props = withDefaults(defineProps<SelectProps<T, VK, M>>(), {
 	placeholder: 'Select an option',
 	variant: 'default',
 	size: 'small',
+	position: 'item-aligned',
+	side: 'bottom',
+	sideOffset: 4,
 });
 const emit = defineEmits<SelectEmits<T, VK, M>>();
 const slots = defineSlots<SelectSlots<T, VK, M>>();
@@ -147,7 +149,14 @@ const groups = computed<SelectItemProps[]>(() => {
 		</SelectTrigger>
 
 		<SelectPortal>
-			<SelectContent :class="$style.selectContent">
+			<SelectContent
+				:class="[$style.selectContent, contentClass]"
+				:position="position"
+				:side="side"
+				:side-offset="sideOffset"
+			>
+				<slot name="header" />
+
 				<SelectScrollUpButton :class="$style.selectScrollButton">
 					<Icon icon="chevron-up" />
 				</SelectScrollUpButton>
@@ -156,7 +165,9 @@ const groups = computed<SelectItemProps[]>(() => {
 					<SelectGroup>
 						<template v-for="(item, index) in groups" :key="`group-${index}`">
 							<SelectLabel v-if="item.type === 'label'" :class="[$style.selectLabel, labelSize]">
-								{{ item.label }}
+								<slot name="label" :item="item">
+									{{ item.label }}
+								</slot>
 							</SelectLabel>
 
 							<SelectSeparator
@@ -182,6 +193,8 @@ const groups = computed<SelectItemProps[]>(() => {
 					</SelectGroup>
 				</SelectViewport>
 
+				<slot name="footer" />
+
 				<SelectScrollDownButton :class="$style.selectScrollButton">
 					<Icon icon="chevron-down" />
 				</SelectScrollDownButton>
@@ -202,7 +215,7 @@ const groups = computed<SelectItemProps[]>(() => {
 	font-weight: var(--font-weight--regular);
 	line-height: var(--line-height--md);
 	border: 1px solid transparent;
-	background-color: var(--color--background--light-2);
+	background-color: light-dark(var(--color--neutral-white), var(--color--neutral-950));
 	height: var(--spacing--lg);
 	position: relative;
 	gap: var(--spacing--3xs);
@@ -276,6 +289,12 @@ const groups = computed<SelectItemProps[]>(() => {
 	 * TODO: Replace with design system z-index variable when available
 	 */
 	z-index: 999999;
+
+	/* When in popper mode, match trigger width and constrain height */
+	&[data-side] {
+		min-width: var(--reka-select-trigger-width);
+		max-height: var(--reka-select-content-available-height);
+	}
 }
 
 .selectViewport {
@@ -286,6 +305,7 @@ const groups = computed<SelectItemProps[]>(() => {
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
+	min-width: 0;
 }
 
 .selectItem {
